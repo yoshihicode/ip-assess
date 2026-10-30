@@ -330,7 +330,7 @@ fi
 ASN_NUM=$(echo "$ASN" | grep -oE '^[0-9]+')
 
 # JSONパース
-#   awk で RDAP の JSON を「パス<TAB>値」の行に展開してから取り出す
+#   jq 非依存。awk で RDAP の JSON を「パス<TAB>値」の行に展開してから取り出す
 #   例) .name<TAB>EXAMPLE-NET / .events[0].eventDate<TAB>2015-01-01T00:00:00Z
 #   これにより、ネストした entities や links 内の同名キーを誤って拾わない
 json_flatten() {
@@ -812,37 +812,20 @@ echo "[4] Report Summary"
 echo "================================================================================"
 
 # 調査優先度: 脅威シグナルがあれば回線種別に関係なく HIGH
-NEXT_STEPS=()
+#   NOTE は誤読による事故（LOW を安全と解釈する、正規クローラーを遮断する）を防ぐ場合のみ表示
+NOTE=""
 if [ "$THREAT_LEVEL" = "DETECTED" ]; then
     PRIORITY="HIGH"
-    FINDING="Threat reputation hit (${THREAT_SIGNALS[*]}). Treat as suspicious regardless of the infrastructure type."
-    if [ "$ISP_HIT" -eq 1 ]; then
-        FINDING="${FINDING} A domestic consumer line with a threat listing often indicates a compromised end-user device (botnet) or a residential proxy."
-    fi
-    NEXT_STEPS+=("Review application and authentication logs for this IP (request rate, paths, login failures, user agents).")
-    NEXT_STEPS+=("If malicious activity is confirmed, block this single IP first. Widen to the allocated CIDR only with additional evidence.")
-    NEXT_STEPS+=("If an attack is confirmed, report it to the abuse contact with log excerpts.")
 elif [ "$VERIFIED_CRAWLER" -eq 1 ] && [ "$INFRA_SCORE" -le 0 ]; then
     PRIORITY="LOW"
-    FINDING="Verified search engine crawler (forward-confirmed reverse DNS)."
-    NEXT_STEPS+=("Do not block. If crawl load is a problem, use robots.txt or the search engine's crawl-rate settings.")
+    NOTE="Verified search engine crawler. Blocking may affect search indexing."
 elif [ "$INFRA_SCORE" -ge 4 ]; then
     PRIORITY="HIGH"
-    FINDING="Multiple infrastructure anomalies. This is not a typical end-user access line."
-    NEXT_STEPS+=("Check whether this IP belongs to an expected service (monitoring, partner integration, your own cloud resources).")
-    NEXT_STEPS+=("If not expected, review its request patterns in the logs. Prefer rate limiting or a challenge over an outright block.")
 elif [ "$INFRA_SCORE" -ge 1 ]; then
     PRIORITY="MEDIUM"
-    FINDING="Some non-consumer traits (e.g. cloud/hosting, PA allocation) were found, but not conclusive."
-    NEXT_STEPS+=("Check whether it is a known integration, an employee VPN, or a monitoring service.")
-    NEXT_STEPS+=("Review its request patterns in the logs (rate, paths, user agents).")
 else
     PRIORITY="LOW"
-    FINDING="No infrastructure anomalies found. This does NOT mean the access is safe: compromised end-user devices and residential proxies look exactly like this."
-    NEXT_STEPS+=("Judge by behavior in the logs: login failures, unusual paths, request rate, and user agents.")
-fi
-if [ "$THREAT_LEVEL" = "UNKNOWN" ]; then
-    NEXT_STEPS+=("Threat reputation could not be fully checked. Re-run with a working resolver / network before concluding.")
+    NOTE="LOW does not mean safe. Compromised end-user devices and residential proxies look the same."
 fi
 RESULT_LABEL="PRIORITY ${PRIORITY} / ${INFRA_CLASS}"
 
@@ -858,12 +841,7 @@ if [ "${#UNAVAILABLE_CHECKS[@]}" -gt 0 ]; then
 else
     echo "Confidence             : FULL - all checks completed"
 fi
-echo "--------------------------------------------------------------------------------"
-echo "Finding    : ${FINDING}"
-echo "Next Steps :"
-for step in "${NEXT_STEPS[@]}"; do
-    echo "  - ${step}"
-done
+[ -n "$NOTE" ] && echo "Note                   : ${NOTE}"
 echo "================================================================================"
 echo ""
 echo "================================================================================"
@@ -937,8 +915,7 @@ if [ "$JSON_MODE" -eq 1 ]; then
     "result": $(jstr "$RESULT_LABEL"),
     "infrastructure": {"class": $(jstr "$INFRA_CLASS"), "score": ${INFRA_SCORE}},
     "threat": {"level": $(jstr "$THREAT_LEVEL"), "signals": $(jarr "$(printf '%s\n' "${THREAT_SIGNALS[@]}")")},
-    "finding": $(jstr "$FINDING"),
-    "next_steps": $(jarr "$(printf '%s\n' "${NEXT_STEPS[@]}")"),
+    "note": $( [ -n "$NOTE" ] && jstr "$NOTE" || echo null ),
     "confidence": $(jstr "$CONFIDENCE"),
     "unavailable_checks": $(jarr "$UNAVAIL_LIST")
   },
