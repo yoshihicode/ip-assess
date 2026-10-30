@@ -4,15 +4,32 @@
 
 ## Usage
 ```
-./ip-assess.sh <IPアドレス>
+./ip-assess.sh [オプション] <IPv4アドレス>
 ```
+
+| オプション | 内容 |
+| :--- | :--- |
+| `--json` | テキストレポートの代わりに JSON（機械可読形式）のみを標準出力へ出力 |
+| `-v`, `--version` | バージョンを表示 |
+| `-h`, `--help` | ヘルプを表示 |
+
+```
+# テキストレポート
+./ip-assess.sh 203.0.113.10
+
+# JSON を証跡として保存
+./ip-assess.sh --json 203.0.113.10 > ip-assess_203.0.113.10.json
+```
+
+> 対象は **IPv4 のみ** です。IPv4 として正しくない文字列を指定した場合はエラーで終了します。
 
 ## 動作要件
 | コマンド | 用途 | 備考 |
 | :--- | :--- | :--- |
-| `bash` / `curl` / `awk` / `sed` / `grep` | 本体処理、RDAP・Tor 出口ノード一覧の取得 | 必須 |
+| `bash` / `curl` / `awk` / `sed` / `grep` | 本体処理、RDAP・Tor 出口ノード一覧の取得、RDAP（JSON）の解析 | 必須 |
 | `dig` または `host` | 逆引き・FCrDNS、DNSBL、ASN の問い合わせ | いずれか必須（`dig` 推奨）。どちらもない場合、該当チェックは判定不能になります |
 | `ping` | レイテンシ測定（仮想ロケーション判定） | 任意 |
+| GNU `date` | 登録日・更新日の経過日数の表示 | 任意 |
 
 > **Spamhaus の問い合わせについて**  
 > Spamhaus は Google Public DNS（8.8.8.8）や Cloudflare（1.1.1.1）などの公開リゾルバ経由の問い合わせを拒否します。実行環境のリゾルバがこれらの場合、DNSBL は毎回「Unknown」となります。ISP のリゾルバ、またはローカルのフルリゾルバ（unbound 等）を利用してください。
@@ -47,10 +64,39 @@
 ### 出力内容
 | 項目 | 出力内容 |
 | :--- | :--- |
-| IP information | 対象IPとRDAP取得ステータス |
-| Network Information  | ネットワーク名、国、割当種別、管轄RIR、管理者住所、逆引き（PTR）と FCrDNS 検証結果、Ping レイテンシ、Tor 出口ノード判定、DNSBL 判定（リスト種別）、ASN / AS 名 / BGP プレフィックス / ASN 登録国、関与組織・担当者ドメイン一覧 |
-| Risk Analysis & Scoring  | 各評価項目の合致状況と配点根拠 |
-| Report Summary | 総合スコア、判定の信頼度（Confidence）、判定結果 |
+| [1] IP information | 対象IP、実行日時、ツールバージョン、使用DNSリゾルバ、RDAP取得ステータスと取得元URL（リダイレクト後に実際に回答したRIR） |
+| [2] Network Information  | ネットワーク名・ハンドル、国、割当種別、割当範囲・CIDR、登録日・最終更新日（経過日数）、管轄RIR、管理者住所、備考、逆引き（PTR）と FCrDNS 検証結果、Ping レイテンシ、Tor 出口ノード判定、DNSBL 判定（リスト種別）、ASN / AS 名 / BGP プレフィックス / ASN 登録国 / プレフィックス割当日、Abuse 連絡先、関与組織・担当者ドメイン一覧 |
+| [3] Risk Analysis & Scoring  | 各評価項目の合致状況と配点根拠 |
+| [4] Report Summary | 総合スコア、判定の信頼度（Confidence）、判定結果 |
+| [5] Data Sources | 各チェックの取得元、RDAP 生データの保存先 |
+
+### JSON 出力（`--json`）
+主なキーは以下のとおりです。
+
+| キー | 内容 |
+| :--- | :--- |
+| `tool` / `executed_at` / `target_ip` | ツール名・バージョン、実行日時、対象IP |
+| `network` | ネットワーク名・ハンドル・国・割当種別・範囲・CIDR・登録日・更新日・RIR・住所・備考 |
+| `asn` | ASN、AS 名、BGP プレフィックス、ASN 登録国、プレフィックス割当日 |
+| `dns` | PTR、FCrDNS の結果（`fcrdns_verified` は真偽値） |
+| `ping_ms` / `tor_exit_node` / `dnsbl` | レイテンシ（取得できない場合は `null`）、Tor 判定、DNSBL 判定 |
+| `abuse_contacts` / `entities` / `emails` | Abuse 連絡先、関与組織名、関与メールアドレス |
+| `indicators` | 合致した評価項目の配列（`type`: `risk` / `safe` / `info`、`points`、`name`、`details`） |
+| `summary` | `score`、`result`、`confidence`（`FULL` / `PARTIAL`）、`unavailable_checks` |
+| `sources` | RDAP 取得元URL、各データソース、DNS リゾルバ、RDAP 生データの保存先 |
+
+RDAP の取得に失敗した場合は、`error` キーを含む JSON を出力して終了コード 1 で終了します。
+
+```json
+{
+  "target_ip": "203.0.113.10",
+  "summary": { "score": 3, "result": "MEDIUM RISK / ...", "confidence": "FULL", "unavailable_checks": [] },
+  "indicators": [
+    { "type": "risk", "points": 3, "name": "Datacenter / Hosting / Cloud infrastructure detected",
+      "details": ["Evidence: Known hosting ASN matched AS16509 (AMAZON-02, US)", "Reason: ..."] }
+  ]
+}
+```
 
 ### スコア
 | スコア | リスク | 評価 | 注意点 |
@@ -63,6 +109,9 @@
 ### 証跡
 スクリプト実行時、APNIC / RIPE 等から返却された生のRDAPレスポンスが以下のパスに保存されます。  
 保存先パス: `/tmp/rdap_<IPアドレス>.json`
+
+診断結果を証跡として残す場合は、`--json` の出力をファイルに保存してください。実行日時・ツールバージョン・各データの取得元・判定根拠がすべて含まれます。  
+※ `/tmp` 配下の RDAP 生データは OS により自動削除される場合があるため、必要に応じて JSON とあわせて別の場所へ保管してください。
 
 ## 免責事項 / Disclaimer
 
