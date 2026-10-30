@@ -4,28 +4,100 @@
 # Risk Assessment Script for IP Addresses
 # ============================================================
 
-IP="$1"
+SCRIPT_NAME="ip-assess"
+SCRIPT_VERSION="1.1.0"
+
+usage() {
+    echo "Usage: $0 [--json] <IPv4_ADDRESS>"
+    echo ""
+    echo "Options:"
+    echo "  --json        Output the result as JSON (machine-readable) instead of the text report"
+    echo "  -v, --version Show version"
+    echo "  -h, --help    Show this help"
+}
+
+JSON_MODE=0
+IP=""
+for arg in "$@"; do
+    case "$arg" in
+        --json)        JSON_MODE=1 ;;
+        -v|--version)  echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit 0 ;;
+        -h|--help)     usage; exit 0 ;;
+        -*)            echo "Error: Unknown option: ${arg}" >&2; usage >&2; exit 1 ;;
+        *)             IP="$arg" ;;
+    esac
+done
 
 if [ -z "$IP" ]; then
-    echo "Usage: $0 <IP_ADDRESS>"
+    usage >&2
+    exit 1
+fi
+
+# 入力検証（IPv4のみ対応。ファイルパスやURLに埋め込むため、形式外の文字列は受け付けない）
+OCTET='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+if ! [[ "$IP" =~ ^${OCTET}\.${OCTET}\.${OCTET}\.${OCTET}$ ]]; then
+    echo "Error: Invalid IPv4 address: ${IP}" >&2
     exit 1
 fi
 
 TMP_FILE="/tmp/rdap_${IP}.json"
+EXECUTED_AT=$(date +%Y-%m-%dT%H:%M:%S%z)
+DNS_RESOLVER=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null)
+[ -z "$DNS_RESOLVER" ] && DNS_RESOLVER="Unknown"
+
+# JSONモードではテキストレポートを捨て、最後にJSONのみを標準出力（fd 3）へ書き出す
+if [ "$JSON_MODE" -eq 1 ]; then
+    exec 3>&1 1>/dev/null
+fi
+
+# JSON文字列のエスケープ
+json_escape() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    v="${v//$'\n'/\\n}"
+    v="${v//$'\r'/\\r}"
+    v="${v//$'\t'/\\t}"
+    printf '%s' "$v" | tr -d '\000-\010\013\014\016-\037'
+}
+# 文字列を JSON 文字列リテラルにする
+jstr() { printf '"%s"' "$(json_escape "$1")"; }
+# 改行区切りの文字列を JSON 配列にする
+jarr() {
+    local first=1 line out="["
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        [ "$first" -eq 1 ] && first=0 || out="${out},"
+        out="${out}$(jstr "$line")"
+    done <<< "$1"
+    printf '%s]' "$out"
+}
 
 echo "================================================================================"
 echo "[1] IP information"
 echo "================================================================================"
-echo "Target IP       : ${IP}"
+echo "Target IP           : ${IP}"
+echo "Executed At         : ${EXECUTED_AT}"
+echo "Tool Version        : ${SCRIPT_NAME} ${SCRIPT_VERSION}"
+echo "DNS Resolver        : ${DNS_RESOLVER}"
 echo "RDAP Temporary File : ${TMP_FILE}"
 
 # RDAP取得
-HTTP_STATUS=$(curl -sL -w "%{http_code}" -o "${TMP_FILE}" "https://rdap.apnic.net/ip/${IP}")
+# リダイレクト後の最終URL（実際に回答したRIR）を証跡として記録する
+CURL_RES=$(curl -sL -w "%{http_code} %{url_effective}" -o "${TMP_FILE}" "https://rdap.apnic.net/ip/${IP}")
+HTTP_STATUS="${CURL_RES%% *}"
+RDAP_URL="${CURL_RES#* }"
 if [ "$HTTP_STATUS" != "200" ]; then
     echo "Error: Failed to retrieve information (HTTP Status: ${HTTP_STATUS})"
+    if [ "$JSON_MODE" -eq 1 ]; then
+        printf '{"tool":{"name":%s,"version":%s},"executed_at":%s,"target_ip":%s,"error":%s}\n' \
+            "$(jstr "$SCRIPT_NAME")" "$(jstr "$SCRIPT_VERSION")" "$(jstr "$EXECUTED_AT")" "$(jstr "$IP")" \
+            "$(jstr "Failed to retrieve RDAP (HTTP Status: ${HTTP_STATUS})")" >&3
+    fi
     exit 1
 fi
-echo "Retrieval Status: Success (HTTP 200)"
+echo "Retrieval Status    : Success (HTTP 200)"
+echo "RDAP Source URL     : ${RDAP_URL}"
 
 # 判定不能だった項目の記録（スコアの信頼性表示に使用）
 UNAVAILABLE_CHECKS=()
@@ -258,7 +330,7 @@ fi
 ASN_NUM=$(echo "$ASN" | grep -oE '^[0-9]+')
 
 # JSONパース
-#   awk で RDAP の JSON を「パス<TAB>値」の行に展開してから取り出す
+#   jq 非依存。awk で RDAP の JSON を「パス<TAB>値」の行に展開してから取り出す
 #   例) .name<TAB>EXAMPLE-NET / .events[0].eventDate<TAB>2015-01-01T00:00:00Z
 #   これにより、ネストした entities や links 内の同名キーを誤って拾わない
 json_flatten() {
@@ -270,11 +342,17 @@ json_flatten() {
             else break
         }
     }
-    function parse_string(   out, c) {
+    function parse_string(   out, c, e) {
         i++; out = ""
         while (i <= n) {
             c = substr(s, i, 1)
-            if (c == "\\") { out = out c substr(s, i + 1, 1); i += 2; continue }
+            if (c == "\\") {
+                e = substr(s, i + 1, 1)
+                if (e == "\"" || e == "\\" || e == "/") out = out e
+                else if (e == "n" || e == "t" || e == "r") out = out " "
+                else out = out c e
+                i += 2; continue
+            }
             if (c == "\"") { i++; return out }
             out = out c; i++
         }
@@ -366,8 +444,10 @@ format_event_date() {
         echo "$d"
     fi
 }
-REG_DATE=$(format_event_date "$(get_event_date "registration")")
-CHANGED_DATE=$(format_event_date "$(get_event_date "last changed")")
+REG_DATE_RAW=$(get_event_date "registration")
+CHANGED_DATE_RAW=$(get_event_date "last changed")
+REG_DATE=$(format_event_date "$REG_DATE_RAW")
+CHANGED_DATE=$(format_event_date "$CHANGED_DATE_RAW")
 
 # Abuse 連絡先（roles に "abuse" を持つエンティティ。ARIN のように入れ子の場合も対応）
 ABUSE_CONTACTS=$(echo "$RDAP_FLAT" | awk -F'\t' '
@@ -424,8 +504,8 @@ fi
 ADDRESS=$(grep -oEi '"label"\s*:\s*"[^"]+"' "${TMP_FILE}" | head -n 1 | sed -E 's/.*:\s*"([^"]+)".*/\1/' | tr '\n' ' ')
 [ -z "$ADDRESS" ] && ADDRESS="Unknown"
 
-# 備考(description)
-REMARKS=$(grep -oEi '"description"\s*:\s*\[\s*"[^"]+"' "${TMP_FILE}" | head -n 3 | sed -E 's/.*"([^"]+)".*/\1/' | tr '\n' ' ')
+# 備考: ネットワーク自身の remarks のみ（notices の利用規約文などは除外）
+REMARKS=$(echo "$RDAP_FLAT" | awk -F'\t' '$1 ~ /^\.remarks\[[0-9]+\]\.description\[[0-9]+\]$/ {print $2}' | head -n 3 | tr '\n' ' ' | sed 's/ $//')
 [ -z "$REMARKS" ] && REMARKS="None"
 
 # メールアドレス/ドメインの抽出
@@ -490,6 +570,31 @@ echo "==========================================================================
 echo "[3] Risk Analysis & Scoring"
 echo "================================================================================"
 
+# 判定結果の記録（テキスト出力と同時に JSON 用の配列へ保存）
+#   indicator "[!] Risk Indicator [+3 pts]: Name"  /  detail "- Evidence : ..."
+IND_JSON=()
+indicator() {
+    echo "$1"
+    local kind="info" pts name
+    case "$1" in
+        "[!]"*) kind="risk" ;;
+        "[o]"*) kind="safe" ;;
+    esac
+    pts=$(echo "$1" | sed -E 's/.*\[([+-]?[0-9]+) pts\].*/\1/')
+    pts="${pts#+}"
+    name="${1#*pts]: }"
+    IND_JSON+=("{\"type\":$(jstr "$kind"),\"points\":${pts},\"name\":$(jstr "$name"),\"details\":[")
+}
+detail() {
+    echo "    $1"
+    local last=$(( ${#IND_JSON[@]} - 1 ))
+    [ "$last" -lt 0 ] && return
+    case "${IND_JSON[$last]}" in
+        *\[) IND_JSON[$last]="${IND_JSON[$last]}$(jstr "${1#- }")" ;;
+        *)   IND_JSON[$last]="${IND_JSON[$last]},$(jstr "${1#- }")" ;;
+    esac
+}
+
 TOTAL_SCORE=0
 VERIFIED_CRAWLER=0
 METADATA_LOWER=$(echo "${NET_NAME} ${ALL_FNS} ${REMARKS} ${DOMAINS} ${ADDRESS}" | tr '[:upper:]' '[:lower:]')
@@ -508,15 +613,15 @@ PTR_TRUSTED_LOWER=""
 CRAWLER_REGEX="(\.googlebot\.com|\.google\.com|\.search\.msn\.com|\.applebot\.apple\.com|\.yandex\.(ru|net|com)|\.baidu\.(com|jp))$"
 if echo "$PTR_LOWER" | grep -qE "$CRAWLER_REGEX"; then
     if [ "$PTR_VERIFIED" -eq 1 ]; then
-        echo "[o] Safe Indicator [-5 pts]: Verified Search Engine Crawler"
-        echo "    - Evidence : FCrDNS-verified PTR='${PTR}'"
-        echo "    - Reason : Officially verifiable crawler. Blocking may affect search indexing (SEO)."
+        indicator "[o] Safe Indicator [-5 pts]: Verified Search Engine Crawler"
+        detail "- Evidence : FCrDNS-verified PTR='${PTR}'"
+        detail "- Reason : Officially verifiable crawler. Blocking may affect search indexing (SEO)."
         TOTAL_SCORE=$((TOTAL_SCORE - 5))
         VERIFIED_CRAWLER=1
     elif [[ "$FCRDNS_STATUS" == Not\ verified* ]]; then
-        echo "[!] Risk Indicator [+3 pts]: Spoofed Search Engine Crawler PTR"
-        echo "    - Evidence : PTR='${PTR}' claims a crawler domain, but forward lookup does not return ${IP}"
-        echo "    - Reason : Reverse DNS is set to impersonate a legitimate crawler. Typical of scrapers evading bot controls."
+        indicator "[!] Risk Indicator [+3 pts]: Spoofed Search Engine Crawler PTR"
+        detail "- Evidence : PTR='${PTR}' claims a crawler domain, but forward lookup does not return ${IP}"
+        detail "- Reason : Reverse DNS is set to impersonate a legitimate crawler. Typical of scrapers evading bot controls."
         TOTAL_SCORE=$((TOTAL_SCORE + 3))
     fi
 fi
@@ -524,13 +629,13 @@ fi
 # A. 国内一般通信キャリア・ISP・モバイル
 ISP_REGEX="(ocn\.ne\.jp|kddi\.ne\.jp|bbtec\.net|mesh\.ad\.jp|plala\.or\.jp|so-net\.ne\.jp|eonet\.ne\.jp|flets|spmode\.ne\.jp|au-net\.ne\.jp|rmobile\.jp|panda-world|nuro\.jp|biglobe\.ne\.jp|iij\.ad\.jp|iijmio|zaq\.ne\.jp|asahi-net|commufa\.jp|bbiq\.jp|megaegg\.ne\.jp|pikara\.ne\.jp|dion\.ne\.jp|vectant|ucom|open-cgn)"
 if echo "$PTR_TRUSTED_LOWER" | grep -qEi "$ISP_REGEX" || echo "$METADATA_LOWER" | grep -qEi "(ntt communications|kddi corporation|softbank corp|rakuten mobile|internet initiative japan|biglobe)"; then
-    echo "[o] Safe Indicator [-5 pts]: Domestic Consumer ISP / Mobile Carrier detected"
+    indicator "[o] Safe Indicator [-5 pts]: Domestic Consumer ISP / Mobile Carrier detected"
     if echo "$PTR_TRUSTED_LOWER" | grep -qEi "$ISP_REGEX"; then
-        echo "    - Evidence : FCrDNS-verified PTR='${PTR}'"
+        detail "- Evidence : FCrDNS-verified PTR='${PTR}'"
     else
-        echo "    - Evidence : Domestic ISP found in Organization Metadata"
+        detail "- Evidence : Domestic ISP found in Organization Metadata"
     fi
-    echo "    - Reason : This is a regular access line used directly by general users in their daily lives."
+    detail "- Reason : This is a regular access line used directly by general users in their daily lives."
     TOTAL_SCORE=$((TOTAL_SCORE - 5))
 fi
 
@@ -538,9 +643,9 @@ fi
 SASE_REGEX="(cato networks|zscaler|cloudflare|netskope|prisma access|palo alto networks|cisco umbrella|iboss|skyhigh|menlo security|forcepoint)"
 if echo "$METADATA_LOWER" | grep -qEi "$SASE_REGEX" || echo "$PTR_TRUSTED_LOWER" | grep -qEi "$SASE_REGEX"; then
     DETECTED_SASE=$(echo "$METADATA_LOWER $PTR_TRUSTED_LOWER" | grep -oEi "$SASE_REGEX" | head -n 1)
-    echo "[o] Safe Indicator [-5 pts]: Enterprise SASE / Zero Trust Gateway detected"
-    echo "    - Evidence: Vendor matched ${DETECTED_SASE}"
-    echo "    - Reason  : The enterprise's business devices are relaying legitimate traffic based on internal policies."
+    indicator "[o] Safe Indicator [-5 pts]: Enterprise SASE / Zero Trust Gateway detected"
+    detail "- Evidence: Vendor matched ${DETECTED_SASE}"
+    detail "- Reason  : The enterprise's business devices are relaying legitimate traffic based on internal policies."
     TOTAL_SCORE=$((TOTAL_SCORE - 5))
 fi
 
@@ -560,76 +665,76 @@ if echo "$METADATA_LOWER" | grep -qEi "$DC_REGEX" || echo "$PTR_LOWER" | grep -q
     DC_KEYWORD_HIT=1
 fi
 if [ "$DC_ASN_HIT" -eq 1 ] || [ "$DC_KEYWORD_HIT" -eq 1 ]; then
-    echo "[!] Risk Indicator [+3 pts]: Datacenter / Hosting / Cloud infrastructure detected"
+    indicator "[!] Risk Indicator [+3 pts]: Datacenter / Hosting / Cloud infrastructure detected"
     if [ "$DC_ASN_HIT" -eq 1 ]; then
-        echo "    - Evidence: Known hosting ASN matched AS${ASN_NUM} (${AS_NAME})"
+        detail "- Evidence: Known hosting ASN matched AS${ASN_NUM} (${AS_NAME})"
     fi
     if [ "$DC_KEYWORD_HIT" -eq 1 ]; then
         DETECTED_DC=$(echo "$METADATA_LOWER $PTR_LOWER" | grep -oEi "$DC_REGEX" | head -n 3 | tr '\n' ' ')
-        echo "    - Evidence: Keywords matched ${DETECTED_DC}"
+        detail "- Evidence: Keywords matched ${DETECTED_DC}"
     fi
-    echo "    - Reason: This is a datacenter, hosting, or cloud infrastructure which is not typically used by individual consumers."
+    detail "- Reason: This is a datacenter, hosting, or cloud infrastructure which is not typically used by individual consumers."
     TOTAL_SCORE=$((TOTAL_SCORE + 3))
 fi
 
 # IP転貸・サブリース (異なるドメインの管理者が複数関与) (+3)
 if [ "$DOMAIN_COUNT" -ge 2 ]; then
-    echo "[!] Risk Indicator [+3 pts]: Datacenter / Hosting / Cloud infrastructure with multiple domain operators detected"
-    echo "    - Evidence: Multiple domain operators found"
-    echo "    - Reason: The IP is associated with multiple domain operators, which is common for proxy services or bulletproof hosting."
+    indicator "[!] Risk Indicator [+3 pts]: IP Sub-leasing / Domain Discrepancy (multiple operator domains)"
+    detail "- Evidence: Multiple domain operators found"
+    detail "- Reason: The IP is associated with multiple domain operators, which is common for proxy services or bulletproof hosting."
     TOTAL_SCORE=$((TOTAL_SCORE + 3))
 fi
 
 # 私書箱 / バーチャルオフィスの検出 (+2)
 if echo "$ADDRESS" | grep -qEi "(suite\s+[0-9]|ste\.?\s+[0-9]|po\s*box|private\s*box)"; then
     MATCH_BOX=$(echo "$ADDRESS" | grep -oEi "(suite\s+[0-9]+|ste\.?\s+[0-9]+|po\s*box\s*[0-9]+)" | head -n 1)
-    echo "[!] Risk Indicator [+2 pts]: Private mailbox / Virtual office address detected"
-    echo "    - Evidence  : '${MATCH_BOX}' (Full Address: ${ADDRESS})"
-    echo "    - Reason: Typical of paper companies with no physical office. Used by suspicious hosting providers or attackers to conceal their identity."
+    indicator "[!] Risk Indicator [+2 pts]: Private mailbox / Virtual office address detected"
+    detail "- Evidence  : '${MATCH_BOX}' (Full Address: ${ADDRESS})"
+    detail "- Reason: Typical of paper companies with no physical office. Used by suspicious hosting providers or attackers to conceal their identity."
     TOTAL_SCORE=$((TOTAL_SCORE + 2))
 fi
 
 # 仮想ロケーション疑い (+2)
 if [ "$PING_VAL" -ge 90 ] && [ "$COUNTRY" = "JP" ]; then
-    echo "[!] Risk Indicator [+2 pts]: Virtual Location (IP Registration Location and Physical Location Mismatch) Suspected"
-    echo "    - Latency: ${PING_MS} (Registered Country: JP)"
-    echo "    - Reason: Despite being registered in Japan, the ping response is 90ms or higher. Due to the physical limitations of optical cables, the actual server is likely located overseas, and the Japanese IP is being used to disguise its location."
+    indicator "[!] Risk Indicator [+2 pts]: Virtual Location (IP Registration Location and Physical Location Mismatch) Suspected"
+    detail "- Latency: ${PING_MS} (Registered Country: JP)"
+    detail "- Reason: Despite being registered in Japan, the ping response is 90ms or higher. Due to the physical limitations of optical cables, the actual server is likely located overseas, and the Japanese IP is being used to disguise its location."
     TOTAL_SCORE=$((TOTAL_SCORE + 2))
 fi
 
 # 小分けブロック (PA) (+1)
 if echo "$IP_TYPE" | grep -qi "PA"; then
-    echo "[!] Risk Indicator [+1 pts]: IP Type is PA (Provider Aggregatable)"
-    echo "    - IP Type  : ${IP_TYPE}"
-    echo "    - Reason: This is a provider-aggregatable IP address, commonly used for reselling or re-selling purposes."
+    indicator "[!] Risk Indicator [+1 pts]: IP Type is PA (Provider Aggregatable)"
+    detail "- IP Type  : ${IP_TYPE}"
+    detail "- Reason: This is a provider-aggregatable IP address, commonly used for reselling or re-selling purposes."
     TOTAL_SCORE=$((TOTAL_SCORE + 1))
 fi
 
 # 一般回線特有の逆引きがない (+1)
 if [ "$PTR" = "None" ] && [ "$TOTAL_SCORE" -gt 0 ]; then
-    echo "[!] Risk Indicator [+1 pts]: No Reverse DNS (PTR) Record Found for Public Access Line"
-    echo "    - Reverse DNS Result: None"
-    echo "    - Reason: Major domestic ISPs typically assign PTR hostnames to dynamic/fixed IPs, but their absence suggests a high likelihood of server usage."
+    indicator "[!] Risk Indicator [+1 pts]: No Reverse DNS (PTR) Record Found for Public Access Line"
+    detail "- Reverse DNS Result: None"
+    detail "- Reason: Major domestic ISPs typically assign PTR hostnames to dynamic/fixed IPs, but their absence suggests a high likelihood of server usage."
     TOTAL_SCORE=$((TOTAL_SCORE + 1))
 fi
 
 # 匿名通信をしている (+5)
 if [ "$TOR_HIT" -eq 1 ]; then
-    echo "[!] Critical Risk [+5 pts]: Confirmed Tor Exit Node"
-    echo "    - Evidence : Matched official Tor Project active exit list."
-    echo "    - Rationale: Traffic is routed through onion encryption; 100% anonymized."
+    indicator "[!] Critical Risk [+5 pts]: Confirmed Tor Exit Node"
+    detail "- Evidence : Matched official Tor Project active exit list."
+    detail "- Rationale: Traffic is routed through onion encryption; 100% anonymized."
     TOTAL_SCORE=$((TOTAL_SCORE + 5))
 fi
 
 # DNSBL登録あり (+4)  ※PBLのみの場合は加点しない
 if [ -n "$DNSBL_HIT" ]; then
-    echo "[!] Critical Risk [+4 pts]: Public Threat Blacklist (DNSBL) listed"
-    echo "    - Evidence : ${DNSBL_STATUS}"
-    echo "    - Rationale: Known source of automated exploitation, spam, botnet, or open relay."
+    indicator "[!] Critical Risk [+4 pts]: Public Threat Blacklist (DNSBL) listed"
+    detail "- Evidence : ${DNSBL_STATUS}"
+    detail "- Rationale: Known source of automated exploitation, spam, botnet, or open relay."
     TOTAL_SCORE=$((TOTAL_SCORE + 4))
 elif [ "$DNSBL_INFO" = "PBL" ]; then
-    echo "[i] Info [0 pts]: Listed on Spamhaus PBL only"
-    echo "    - Reason : PBL lists end-user / dynamic IP ranges that should not send mail directly. Not a threat indicator."
+    indicator "[i] Info [0 pts]: Listed on Spamhaus PBL only"
+    detail "- Reason : PBL lists end-user / dynamic IP ranges that should not send mail directly. Not a threat indicator."
 fi
 
 echo ""
@@ -649,23 +754,112 @@ fi
 echo "--------------------------------------------------------------------------------"
 
 if [ "$VERIFIED_CRAWLER" -eq 1 ] && [ "$TOTAL_SCORE" -le 0 ]; then
-    echo "Test Result     : LOW RISK / VERIFIED SEARCH ENGINE CRAWLER"
+    RESULT_LABEL="LOW RISK / VERIFIED SEARCH ENGINE CRAWLER"
+    echo "Test Result     : ${RESULT_LABEL}"
     echo "Assessment      : Forward-confirmed reverse DNS matches an official search engine crawler domain."
     echo "Note            : Do not block unless crawl rate is a problem; control it via robots.txt or crawl-rate settings instead."
 
 elif [ "$TOTAL_SCORE" -le 0 ]; then
-    echo "Test Result     : LOW RISK / RESIDENTIAL OR ENTERPRISE ACCESS"
+    RESULT_LABEL="LOW RISK / RESIDENTIAL OR ENTERPRISE ACCESS"
+    echo "Test Result     : ${RESULT_LABEL}"
     echo "Assessment      : Originates from a domestic ISP or verified enterprise SASE. No anonymization detected."
     echo "Note            : It is highly likely that this is a line used by general end users on a daily basis."
 
 elif [ "$TOTAL_SCORE" -ge 4 ]; then
-    echo "Test Result     : HIGH RISK / PROXY, DATACENTER, OR ANONYMIZED ACCESS"
+    RESULT_LABEL="HIGH RISK / PROXY, DATACENTER, OR ANONYMIZED ACCESS"
+    echo "Test Result     : ${RESULT_LABEL}"
     echo "Assessment      : Multiple indicators detected (datacenter line, IP sub-lease, or offshore routing)."
     echo "Note            : Extremely unlikely to be direct access from an authentic domestic end-user."
 
 else
-    echo "Test Result     : MEDIUM RISK / ATTRIBUTE UNKNOWN / MONITORING REQUIRED"
+    RESULT_LABEL="MEDIUM RISK / ATTRIBUTE UNKNOWN / MONITORING REQUIRED"
+    echo "Test Result     : ${RESULT_LABEL}"
     echo "Assessment      : Exhibits non-consumer traits (cloud/hosting traits or PA allocation), but unconfirmed."
     echo "Note            : Potential unapproved personal VPN, web crawler, or automated scraper."
 fi
 echo "================================================================================"
+
+echo ""
+echo "================================================================================"
+echo "[5] Data Sources"
+echo "================================================================================"
+echo "RDAP             : ${RDAP_URL}"
+echo "Tor Exit List    : https://check.torproject.org/torbulkexitlist"
+echo "DNSBL            : zen.spamhaus.org (via ${DNS_RESOLVER})"
+echo "ASN              : Team Cymru IP to ASN Mapping (origin.asn.cymru.com / asn.cymru.com)"
+echo "Reverse/Forward  : DNS via ${DNS_RESOLVER}"
+echo "RDAP Raw Data    : ${TMP_FILE}"
+echo "================================================================================"
+
+# JSON 出力
+if [ "$JSON_MODE" -eq 1 ]; then
+    if [ "${#UNAVAILABLE_CHECKS[@]}" -gt 0 ]; then
+        CONFIDENCE="PARTIAL"
+        UNAVAIL_LIST=$(printf '%s\n' "${UNAVAILABLE_CHECKS[@]}")
+    else
+        CONFIDENCE="FULL"
+        UNAVAIL_LIST=""
+    fi
+    IND_OUT=""
+    for item in "${IND_JSON[@]}"; do
+        [ -n "$IND_OUT" ] && IND_OUT="${IND_OUT},"
+        IND_OUT="${IND_OUT}${item}]}"
+    done
+    ABUSE_EMAILS=$(echo "$ABUSE_CONTACTS" | awk -F'|' '{gsub(/^ +| +$/,"",$1); n=split($1,a,", "); for(k=1;k<=n;k++) if(a[k]!="(no email)") print a[k]}' | sort -u)
+    PING_JSON="null"
+    [ -n "$PING_MS" ] && PING_JSON="$PING_MS"
+
+    cat >&3 <<JSON
+{
+  "tool": {"name": $(jstr "$SCRIPT_NAME"), "version": $(jstr "$SCRIPT_VERSION")},
+  "executed_at": $(jstr "$EXECUTED_AT"),
+  "target_ip": $(jstr "$IP"),
+  "network": {
+    "name": $(jstr "$NET_NAME"),
+    "handle": $(jstr "$NET_HANDLE"),
+    "country": $(jstr "$COUNTRY"),
+    "allocation_type": $(jstr "$IP_TYPE"),
+    "range": $(jstr "$NET_RANGE"),
+    "cidr": $(jstr "$NET_CIDRS"),
+    "registered": $(jstr "$REG_DATE_RAW"),
+    "last_changed": $(jstr "$CHANGED_DATE_RAW"),
+    "rir": $(jstr "$RIR"),
+    "address": $(jstr "$ADDRESS"),
+    "remarks": $(jstr "$REMARKS")
+  },
+  "asn": {
+    "asn": $(jstr "$ASN"),
+    "name": $(jstr "$AS_NAME"),
+    "bgp_prefix": $(jstr "$BGP_PREFIX"),
+    "country": $(jstr "$ASN_CC"),
+    "prefix_allocated": $(jstr "$PREFIX_ALLOCATED")
+  },
+  "dns": {
+    "ptr": $(jstr "$PTR"),
+    "fcrdns": $(jstr "$FCRDNS_STATUS"),
+    "fcrdns_verified": $( [ "$PTR_VERIFIED" -eq 1 ] && echo true || echo false )
+  },
+  "ping_ms": ${PING_JSON},
+  "tor_exit_node": $(jstr "$TOR_STATUS"),
+  "dnsbl": $(jstr "$DNSBL_STATUS"),
+  "abuse_contacts": $(jarr "$ABUSE_EMAILS"),
+  "entities": $(jarr "$ALL_FNS"),
+  "emails": $(jarr "$ALL_EMAILS"),
+  "indicators": [${IND_OUT}],
+  "summary": {
+    "score": ${TOTAL_SCORE},
+    "result": $(jstr "$RESULT_LABEL"),
+    "confidence": $(jstr "$CONFIDENCE"),
+    "unavailable_checks": $(jarr "$UNAVAIL_LIST")
+  },
+  "sources": {
+    "rdap": $(jstr "$RDAP_URL"),
+    "tor_exit_list": "https://check.torproject.org/torbulkexitlist",
+    "dnsbl": "zen.spamhaus.org",
+    "asn": "Team Cymru IP to ASN Mapping",
+    "dns_resolver": $(jstr "$DNS_RESOLVER"),
+    "rdap_raw_file": $(jstr "$TMP_FILE")
+  }
+}
+JSON
+fi
