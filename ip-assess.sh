@@ -200,6 +200,7 @@ ASN="Unknown"
 AS_NAME="Unknown"
 BGP_PREFIX="Unknown"
 ASN_CC="Unknown"
+PREFIX_ALLOCATED="Unknown"
 
 # 戻り値: 標準出力にTXTレコード（引用符除去済み）。終了コード 0=取得成功 / 1=該当なし / 2=問い合わせ失敗
 query_txt() {
@@ -237,6 +238,7 @@ if [ "$ORIGIN_RC" -eq 0 ]; then
     ASN=$(echo "$ORIGIN_LINE" | awk -F'|' '{gsub(/ /,"",$1); print $1}' | awk '{print $1}')
     BGP_PREFIX=$(echo "$ORIGIN_LINE" | awk -F'|' '{gsub(/ /,"",$2); print $2}')
     ASN_CC=$(echo "$ORIGIN_LINE" | awk -F'|' '{gsub(/ /,"",$3); print $3}')
+    PREFIX_ALLOCATED=$(echo "$ORIGIN_LINE" | awk -F'|' '{gsub(/ /,"",$5); print $5}')
     # 同一ASの包含プレフィックスは除き、異なるオリジンAS（MOAS）のみ数える
     OTHER_ASNS=$(echo "$ORIGIN_RES" | awk -F'|' '{gsub(/ /,"",$1); print $1}' | tr ' ' '\n' | grep -v "^${ASN}$" | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')
     [ -n "$OTHER_ASNS" ] && ASN="${ASN} (also announced by AS: ${OTHER_ASNS})"
@@ -256,10 +258,140 @@ fi
 ASN_NUM=$(echo "$ASN" | grep -oE '^[0-9]+')
 
 # JSONパース
-NET_NAME=$(grep -oEi '"name"\s*:\s*"[^"]+"' "${TMP_FILE}" | head -n 1 | sed -E 's/.*:\s*"([^"]+)".*/\1/')
-COUNTRY=$(grep -oEi '"country"\s*:\s*"[^"]+"' "${TMP_FILE}" | head -n 1 | sed -E 's/.*:\s*"([^"]+)".*/\1/')
-IP_TYPE=$(grep -oEi '"type"\s*:\s*"[^"]+"' "${TMP_FILE}" | head -n 1 | sed -E 's/.*:\s*"([^"]+)".*/\1/')
-PORT43=$(grep -oEi '"port43"\s*:\s*"[^"]+"' "${TMP_FILE}" | head -n 1 | sed -E 's/.*:\s*"([^"]+)".*/\1/')
+#   awk で RDAP の JSON を「パス<TAB>値」の行に展開してから取り出す
+#   例) .name<TAB>EXAMPLE-NET / .events[0].eventDate<TAB>2015-01-01T00:00:00Z
+#   これにより、ネストした entities や links 内の同名キーを誤って拾わない
+json_flatten() {
+    awk '
+    function skip_ws(   c) {
+        while (i <= n) {
+            c = substr(s, i, 1)
+            if (c == " " || c == "\t" || c == "\n" || c == "\r") i++
+            else break
+        }
+    }
+    function parse_string(   out, c) {
+        i++; out = ""
+        while (i <= n) {
+            c = substr(s, i, 1)
+            if (c == "\\") { out = out c substr(s, i + 1, 1); i += 2; continue }
+            if (c == "\"") { i++; return out }
+            out = out c; i++
+        }
+        return out
+    }
+    function parse_value(path,   c, k, idx, v) {
+        skip_ws(); c = substr(s, i, 1)
+        if (c == "{") {
+            i++; skip_ws()
+            if (substr(s, i, 1) == "}") { i++; return }
+            while (i <= n) {
+                skip_ws(); k = parse_string(); skip_ws(); i++
+                parse_value(path "." k)
+                skip_ws(); c = substr(s, i, 1); i++
+                if (c != ",") return
+            }
+        } else if (c == "[") {
+            i++; skip_ws()
+            if (substr(s, i, 1) == "]") { i++; return }
+            idx = 0
+            while (i <= n) {
+                parse_value(path "[" idx "]"); idx++
+                skip_ws(); c = substr(s, i, 1); i++
+                if (c != ",") return
+            }
+        } else if (c == "\"") {
+            v = parse_string(); gsub(/[\t\n\r]/, " ", v); print path "\t" v
+        } else {
+            v = ""
+            while (i <= n) {
+                c = substr(s, i, 1)
+                if (c == "," || c == "}" || c == "]" || c == " " || c == "\t" || c == "\n" || c == "\r") break
+                v = v c; i++
+            }
+            print path "\t" v
+        }
+    }
+    { s = s $0 "\n" }
+    END { n = length(s); i = 1; parse_value("") }
+    ' "$1"
+}
+
+# 展開結果からパスに完全一致する最初の値を取り出す
+jget() {
+    echo "$RDAP_FLAT" | awk -F'\t' -v p="$1" '$1 == p { print $2; exit }'
+}
+
+RDAP_FLAT=$(json_flatten "${TMP_FILE}")
+
+# トップレベルの値を取得（取得できない場合のみ従来の grep 抽出にフォールバック）
+NET_NAME=$(jget ".name")
+COUNTRY=$(jget ".country")
+IP_TYPE=$(jget ".type")
+PORT43=$(jget ".port43")
+[ -z "$NET_NAME" ] && NET_NAME=$(grep -oEi '"name"\s*:\s*"[^"]+"' "${TMP_FILE}" | head -n 1 | sed -E 's/.*:\s*"([^"]+)".*/\1/')
+[ -z "$COUNTRY" ]  && COUNTRY=$(grep -oEi '"country"\s*:\s*"[^"]+"' "${TMP_FILE}" | head -n 1 | sed -E 's/.*:\s*"([^"]+)".*/\1/')
+[ -z "$PORT43" ]   && PORT43=$(grep -oEi '"port43"\s*:\s*"[^"]+"' "${TMP_FILE}" | head -n 1 | sed -E 's/.*:\s*"([^"]+)".*/\1/')
+
+# 割当ブロック（範囲・CIDR・ハンドル）
+NET_HANDLE=$(jget ".handle")
+NET_START=$(jget ".startAddress")
+NET_END=$(jget ".endAddress")
+NET_CIDRS=$(echo "$RDAP_FLAT" | awk -F'\t' '
+    $1 ~ /^\.cidr0_cidrs\[[0-9]+\]\.v[46]prefix$/ { sub(/\.v[46]prefix$/, "", $1); pfx[$1] = $2; order[++m] = $1 }
+    $1 ~ /^\.cidr0_cidrs\[[0-9]+\]\.length$/      { sub(/\.length$/, "", $1); len[$1] = $2 }
+    END { for (j = 1; j <= m; j++) printf "%s%s/%s", (j > 1 ? ", " : ""), pfx[order[j]], len[order[j]] }')
+[ -z "$NET_HANDLE" ] && NET_HANDLE="Unknown"
+NET_RANGE="Unknown"
+[ -n "$NET_START" ] && [ -n "$NET_END" ] && NET_RANGE="${NET_START} - ${NET_END}"
+[ -z "$NET_CIDRS" ] && NET_CIDRS="Unknown"
+
+# 登録日・最終更新日（トップレベルの events のみ。entities 内の events は対象外）
+get_event_date() {
+    echo "$RDAP_FLAT" | awk -F'\t' -v act="$1" '
+        $1 ~ /^\.events\[[0-9]+\]\.eventAction$/ && $2 == act { k = $1; sub(/\.eventAction$/, "", k); want[k] = 1 }
+        $1 ~ /^\.events\[[0-9]+\]\.eventDate$/   { k = $1; sub(/\.eventDate$/, "", k); d[k] = $2 }
+        END { for (k in want) if (k in d) { print d[k]; exit } }'
+}
+# 経過日数を併記（GNU date が使える環境のみ）
+format_event_date() {
+    local d="$1" epoch now days
+    [ -z "$d" ] && { echo "Unknown"; return; }
+    epoch=$(date -d "$d" +%s 2>/dev/null)
+    if [ -n "$epoch" ]; then
+        now=$(date +%s)
+        days=$(( (now - epoch) / 86400 ))
+        echo "${d} (${days} days ago)"
+    else
+        echo "$d"
+    fi
+}
+REG_DATE=$(format_event_date "$(get_event_date "registration")")
+CHANGED_DATE=$(format_event_date "$(get_event_date "last changed")")
+
+# Abuse 連絡先（roles に "abuse" を持つエンティティ。ARIN のように入れ子の場合も対応）
+ABUSE_CONTACTS=$(echo "$RDAP_FLAT" | awk -F'\t' '
+    { path[NR] = $1; val[NR] = $2 }
+    $1 ~ /\.roles\[[0-9]+\]$/ && $2 == "abuse" { e = $1; sub(/\.roles\[[0-9]+\]$/, "", e); ent[e] = 1; eorder[++m] = e }
+    END {
+        for (j = 1; j <= m; j++) {
+            e = eorder[j]; if (done[e]++) continue
+            vp = e ".vcardArray[1]"; name = ""; mails = ""
+            for (r = 1; r <= NR; r++) {
+                if (index(path[r], vp "[") != 1) continue
+                rest = substr(path[r], length(vp) + 1)
+                if (rest ~ /^\[[0-9]+\]\[0\]$/) { prop[rest] = val[r] }
+                if (rest ~ /^\[[0-9]+\]\[3\]$/) {
+                    key = rest; sub(/\[3\]$/, "[0]", key)
+                    if (prop[key] == "fn") name = val[r]
+                    if (prop[key] == "email" && index(mails, val[r]) == 0) mails = mails (mails ? ", " : "") val[r]
+                }
+            }
+            h = ""
+            for (r = 1; r <= NR; r++) if (path[r] == e ".handle") { h = val[r]; break }
+            printf "%s | %s | %s\n", (mails ? mails : "(no email)"), (name ? name : "-"), (h ? h : "-")
+        }
+    }')
 
 [ -z "$NET_NAME" ] && NET_NAME="Unknown"
 [ -z "$COUNTRY" ] && COUNTRY="Unknown"
@@ -311,6 +443,11 @@ echo "==========================================================================
 echo "Network Name           : ${NET_NAME}"
 echo "Egress Node Country    : ${COUNTRY}"
 echo "Allocation Type        : ${IP_TYPE}"
+echo "Network Handle         : ${NET_HANDLE}"
+echo "Allocated Range        : ${NET_RANGE}"
+echo "Allocated CIDR         : ${NET_CIDRS}"
+echo "Registered             : ${REG_DATE}"
+echo "Last Changed           : ${CHANGED_DATE}"
 echo "RIR                    : ${RIR}"
 echo "RIR Country            : ${RIR_COUNTRY}"
 echo "Admin Physical Address : ${ADDRESS}"
@@ -324,6 +461,16 @@ echo "ASN                    : ${ASN}"
 echo "AS Name                : ${AS_NAME}"
 echo "BGP Prefix             : ${BGP_PREFIX}"
 echo "ASN Registered Country : ${ASN_CC}"
+echo "Prefix Allocated (RIR) : ${PREFIX_ALLOCATED}"
+echo ""
+echo "--- Abuse Contact (for reporting) ---"
+if [ -n "$ABUSE_CONTACTS" ]; then
+    echo "$ABUSE_CONTACTS" | while IFS='|' read -r mail name handle; do
+        echo "  - Email : $(echo $mail)  [Name: $(echo $name) / Handle: $(echo $handle)]"
+    done
+else
+    echo "  - Not found in RDAP response"
+fi
 echo ""
 echo "--- Associated Organizations / Contacts ---"
 echo "$ALL_FNS" | while read -r fn; do
