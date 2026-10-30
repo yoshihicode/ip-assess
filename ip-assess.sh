@@ -53,31 +53,89 @@ else
     PING_STR="Command not found"
 fi
 
+# 判定不能だった項目の記録（スコアの信頼性表示に使用）
+UNAVAILABLE_CHECKS=()
+
 # Tor（匿名通信）のチェック
+#   取得失敗時に「No」と誤表示しないよう、リスト取得の成否を先に確認する
 TOR_STATUS="No"
 TOR_HIT=0
-if curl -s --connect-timeout 3 --max-time 5 https://check.torproject.org/torbulkexitlist | grep -qx "${IP}"; then
+TOR_LIST=$(curl -sf --connect-timeout 3 --max-time 10 https://check.torproject.org/torbulkexitlist 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$TOR_LIST" ]; then
+    TOR_STATUS="Unknown (Failed to fetch Tor exit list)"
+    UNAVAILABLE_CHECKS+=("Tor Exit Node")
+elif echo "$TOR_LIST" | grep -qx "${IP}"; then
     TOR_STATUS="Yes (Confirmed Tor Exit Node)"
     TOR_HIT=1
 fi
 
-# DNSBL（Spamhaus等）のチェック
+# DNSBL（Spamhaus ZEN）のチェック
+#   返り値の意味:
+#     127.0.0.2        SBL  (スパム送信元)
+#     127.0.0.3        CSS  (スパム送信元・低評価)
+#     127.0.0.4-7      XBL  (マルウェア感染端末・不正プロキシ)
+#     127.0.0.9        DROP (犯罪者管理下のネットワーク)
+#     127.0.0.10-11    PBL  (一般回線の動的IP等。脅威ではないため加点しない)
+#     127.255.255.x    エラー (公開リゾルバ経由・クエリ超過等で拒否)
 REV_IP=$(echo "$IP" | awk -F'.' '{print $4"."$3"."$2"."$1}')
 DNSBL_STATUS="Clean / Unlisted"
-DNSBL_HIT=""
-check_dnsbl() {
-    local host_res=""
-    if command -v host >/dev/null 2>&1; then
-        host_res=$(host "${REV_IP}.$1" 2>/dev/null | grep -E "has address 127\.0\.0\.[0-9]+" | awk '{print $NF}' | head -n 1)
-    elif command -v dig >/dev/null 2>&1; then
-        host_res=$(dig +short "${REV_IP}.$1" 2>/dev/null | grep -E "^127\.0\.0\.[0-9]+" | head -n 1)
+DNSBL_HIT=""        # 加点対象のリスト名 (SBL/CSS/XBL/DROP)
+DNSBL_INFO=""       # 加点しない情報 (PBL)
+
+# 戻り値: 標準出力にA レコード（改行区切り）。終了コード 0=取得成功 / 1=未登録 / 2=問い合わせ失敗
+query_dnsbl() {
+    local qname="${REV_IP}.$1" out status
+    if command -v dig >/dev/null 2>&1; then
+        out=$(dig +time=3 +tries=1 A "$qname" 2>/dev/null)
+        status=$(echo "$out" | awk '/status:/ {gsub(",","",$6); print $6; exit}')
+        case "$status" in
+            NOERROR)
+                echo "$out" | awk '$4=="A" {print $5}'
+                return 0 ;;
+            NXDOMAIN) return 1 ;;
+            *) return 2 ;;
+        esac
+    elif command -v host >/dev/null 2>&1; then
+        out=$(host -W 3 -t A "$qname" 2>&1)
+        if echo "$out" | grep -q "has address"; then
+            echo "$out" | awk '/has address/ {print $NF}'
+            return 0
+        elif echo "$out" | grep -q "NXDOMAIN"; then
+            return 1
+        fi
+        return 2
     fi
-    [ -n "$host_res" ] && echo "$host_res"
+    return 2
 }
-SPAMHAUS_RES=$(check_dnsbl "zen.spamhaus.org")
-if [ -n "$SPAMHAUS_RES" ]; then
-    DNSBL_STATUS="Listed (Spamhaus ZEN: ${SPAMHAUS_RES})"
-    DNSBL_HIT="Spamhaus ZEN"
+
+SPAMHAUS_RES=$(query_dnsbl "zen.spamhaus.org")
+SPAMHAUS_RC=$?
+
+if [ "$SPAMHAUS_RC" -eq 2 ]; then
+    DNSBL_STATUS="Unknown (DNS query failed / dig or host not found)"
+    UNAVAILABLE_CHECKS+=("DNSBL (Spamhaus ZEN)")
+elif [ "$SPAMHAUS_RC" -eq 0 ]; then
+    if echo "$SPAMHAUS_RES" | grep -q "^127\.255\.255\."; then
+        DNSBL_STATUS="Unknown (Query refused by Spamhaus: $(echo "$SPAMHAUS_RES" | head -n1) - public resolver or rate limit)"
+        UNAVAILABLE_CHECKS+=("DNSBL (Spamhaus ZEN)")
+    else
+        LISTS=()
+        for code in $SPAMHAUS_RES; do
+            case "$code" in
+                127.0.0.2)          LISTS+=("SBL") ;;
+                127.0.0.3)          LISTS+=("CSS") ;;
+                127.0.0.[4-7])      LISTS+=("XBL") ;;
+                127.0.0.9)          LISTS+=("DROP") ;;
+                127.0.0.10|127.0.0.11) DNSBL_INFO="PBL" ;;
+            esac
+        done
+        DNSBL_HIT=$(printf '%s\n' "${LISTS[@]}" | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')
+        if [ -n "$DNSBL_HIT" ]; then
+            DNSBL_STATUS="Listed (Spamhaus ZEN: ${DNSBL_HIT} / $(echo $SPAMHAUS_RES))"
+        elif [ -n "$DNSBL_INFO" ]; then
+            DNSBL_STATUS="PBL only (Policy list for end-user IP ranges / not a threat indicator)"
+        fi
+    fi
 fi
 
 # JSONパース
@@ -251,12 +309,15 @@ if [ "$TOR_HIT" -eq 1 ]; then
     TOTAL_SCORE=$((TOTAL_SCORE + 5))
 fi
 
-# DNSBL登録あり (+4)
+# DNSBL登録あり (+4)  ※PBLのみの場合は加点しない
 if [ -n "$DNSBL_HIT" ]; then
     echo "[!] Critical Risk [+4 pts]: Public Threat Blacklist (DNSBL) listed"
-    echo "    - Evidence : Listed on ${DNSBL_STATUS}"
+    echo "    - Evidence : ${DNSBL_STATUS}"
     echo "    - Rationale: Known source of automated exploitation, spam, botnet, or open relay."
     TOTAL_SCORE=$((TOTAL_SCORE + 4))
+elif [ "$DNSBL_INFO" = "PBL" ]; then
+    echo "[i] Info [0 pts]: Listed on Spamhaus PBL only"
+    echo "    - Reason : PBL lists end-user / dynamic IP ranges that should not send mail directly. Not a threat indicator."
 fi
 
 echo ""
@@ -264,6 +325,15 @@ echo "==========================================================================
 echo "[4] Report Summary"
 echo "================================================================================"
 echo "Total Risk Score : ${TOTAL_SCORE} Points"
+if [ "${#UNAVAILABLE_CHECKS[@]}" -gt 0 ]; then
+    echo "Confidence       : PARTIAL - the following checks could not be completed:"
+    for c in "${UNAVAILABLE_CHECKS[@]}"; do
+        echo "                   - ${c}"
+    done
+    echo "                   The actual score may be higher than shown."
+else
+    echo "Confidence       : FULL - all checks completed"
+fi
 echo "--------------------------------------------------------------------------------"
 
 if [ "$TOTAL_SCORE" -le 0 ]; then
