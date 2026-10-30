@@ -5,7 +5,7 @@
 # ============================================================
 
 SCRIPT_NAME="ip-assess"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 usage() {
     echo "Usage: $0 [--json] <IPv4_ADDRESS>"
@@ -330,7 +330,7 @@ fi
 ASN_NUM=$(echo "$ASN" | grep -oE '^[0-9]+')
 
 # JSONパース
-#   jq 非依存。awk で RDAP の JSON を「パス<TAB>値」の行に展開してから取り出す
+#   awk で RDAP の JSON を「パス<TAB>値」の行に展開してから取り出す
 #   例) .name<TAB>EXAMPLE-NET / .events[0].eventDate<TAB>2015-01-01T00:00:00Z
 #   これにより、ネストした entities や links 内の同名キーを誤って拾わない
 json_flatten() {
@@ -567,7 +567,7 @@ done
 
 echo ""
 echo "================================================================================"
-echo "[3] Risk Analysis & Scoring"
+echo "[3] Analysis"
 echo "================================================================================"
 
 # 判定結果の記録（テキスト出力と同時に JSON 用の配列へ保存）
@@ -577,12 +577,18 @@ indicator() {
     echo "$1"
     local kind="info" pts name
     case "$1" in
+        "[X]"*) kind="threat" ;;
         "[!]"*) kind="risk" ;;
         "[o]"*) kind="safe" ;;
     esac
-    pts=$(echo "$1" | sed -E 's/.*\[([+-]?[0-9]+) pts\].*/\1/')
-    pts="${pts#+}"
-    name="${1#*pts]: }"
+    if [[ "$1" == *" pts]: "* ]]; then
+        pts=$(echo "$1" | sed -E 's/.*\[([+-]?[0-9]+) pts\].*/\1/')
+        pts="${pts#+}"
+        name="${1#*pts]: }"
+    else
+        pts=0
+        name="${1#*: }"
+    fi
     IND_JSON+=("{\"type\":$(jstr "$kind"),\"points\":${pts},\"name\":$(jstr "$name"),\"details\":[")
 }
 detail() {
@@ -595,14 +601,20 @@ detail() {
     esac
 }
 
-TOTAL_SCORE=0
+INFRA_SCORE=0
 VERIFIED_CRAWLER=0
+SPOOFED_CRAWLER=0
+ISP_HIT=0
+SASE_HIT=0
+DC_HIT=0
 METADATA_LOWER=$(echo "${NET_NAME} ${ALL_FNS} ${REMARKS} ${DOMAINS} ${ADDRESS}" | tr '[:upper:]' '[:lower:]')
 PTR_LOWER=""
 [ "$PTR_RC" -eq 0 ] && PTR_LOWER=$(echo "${PTR}" | tr '[:upper:]' '[:lower:]')
 # 減点（安全側）の判定には、なりすまし防止のため FCrDNS 検証済みの PTR のみを使う
 PTR_TRUSTED_LOWER=""
 [ "$PTR_VERIFIED" -eq 1 ] && PTR_TRUSTED_LOWER="$PTR_LOWER"
+
+echo "--- [3-1] Infrastructure Attributes (scored) ---"
 
 # ------------------------------------------------------------
 # 減点要因: 安全な正規通信の検証
@@ -616,13 +628,11 @@ if echo "$PTR_LOWER" | grep -qE "$CRAWLER_REGEX"; then
         indicator "[o] Safe Indicator [-5 pts]: Verified Search Engine Crawler"
         detail "- Evidence : FCrDNS-verified PTR='${PTR}'"
         detail "- Reason : Officially verifiable crawler. Blocking may affect search indexing (SEO)."
-        TOTAL_SCORE=$((TOTAL_SCORE - 5))
+        INFRA_SCORE=$((INFRA_SCORE - 5))
         VERIFIED_CRAWLER=1
     elif [[ "$FCRDNS_STATUS" == Not\ verified* ]]; then
-        indicator "[!] Risk Indicator [+3 pts]: Spoofed Search Engine Crawler PTR"
-        detail "- Evidence : PTR='${PTR}' claims a crawler domain, but forward lookup does not return ${IP}"
-        detail "- Reason : Reverse DNS is set to impersonate a legitimate crawler. Typical of scrapers evading bot controls."
-        TOTAL_SCORE=$((TOTAL_SCORE + 3))
+        # なりすましは回線属性ではなく脅威シグナルとして [3-2] で扱う
+        SPOOFED_CRAWLER=1
     fi
 fi
 
@@ -636,7 +646,8 @@ if echo "$PTR_TRUSTED_LOWER" | grep -qEi "$ISP_REGEX" || echo "$METADATA_LOWER" 
         detail "- Evidence : Domestic ISP found in Organization Metadata"
     fi
     detail "- Reason : This is a regular access line used directly by general users in their daily lives."
-    TOTAL_SCORE=$((TOTAL_SCORE - 5))
+    INFRA_SCORE=$((INFRA_SCORE - 5))
+    ISP_HIT=1
 fi
 
 # B. 企業向け SASE / 業務 VPN
@@ -646,7 +657,8 @@ if echo "$METADATA_LOWER" | grep -qEi "$SASE_REGEX" || echo "$PTR_TRUSTED_LOWER"
     indicator "[o] Safe Indicator [-5 pts]: Enterprise SASE / Zero Trust Gateway detected"
     detail "- Evidence: Vendor matched ${DETECTED_SASE}"
     detail "- Reason  : The enterprise's business devices are relaying legitimate traffic based on internal policies."
-    TOTAL_SCORE=$((TOTAL_SCORE - 5))
+    INFRA_SCORE=$((INFRA_SCORE - 5))
+    SASE_HIT=1
 fi
 
 # ------------------------------------------------------------
@@ -674,7 +686,8 @@ if [ "$DC_ASN_HIT" -eq 1 ] || [ "$DC_KEYWORD_HIT" -eq 1 ]; then
         detail "- Evidence: Keywords matched ${DETECTED_DC}"
     fi
     detail "- Reason: This is a datacenter, hosting, or cloud infrastructure which is not typically used by individual consumers."
-    TOTAL_SCORE=$((TOTAL_SCORE + 3))
+    INFRA_SCORE=$((INFRA_SCORE + 3))
+    DC_HIT=1
 fi
 
 # IP転貸・サブリース (異なるドメインの管理者が複数関与) (+3)
@@ -682,7 +695,7 @@ if [ "$DOMAIN_COUNT" -ge 2 ]; then
     indicator "[!] Risk Indicator [+3 pts]: IP Sub-leasing / Domain Discrepancy (multiple operator domains)"
     detail "- Evidence: Multiple domain operators found"
     detail "- Reason: The IP is associated with multiple domain operators, which is common for proxy services or bulletproof hosting."
-    TOTAL_SCORE=$((TOTAL_SCORE + 3))
+    INFRA_SCORE=$((INFRA_SCORE + 3))
 fi
 
 # 私書箱 / バーチャルオフィスの検出 (+2)
@@ -691,7 +704,7 @@ if echo "$ADDRESS" | grep -qEi "(suite\s+[0-9]|ste\.?\s+[0-9]|po\s*box|private\s
     indicator "[!] Risk Indicator [+2 pts]: Private mailbox / Virtual office address detected"
     detail "- Evidence  : '${MATCH_BOX}' (Full Address: ${ADDRESS})"
     detail "- Reason: Typical of paper companies with no physical office. Used by suspicious hosting providers or attackers to conceal their identity."
-    TOTAL_SCORE=$((TOTAL_SCORE + 2))
+    INFRA_SCORE=$((INFRA_SCORE + 2))
 fi
 
 # 仮想ロケーション疑い (+2)
@@ -699,7 +712,7 @@ if [ "$PING_VAL" -ge 90 ] && [ "$COUNTRY" = "JP" ]; then
     indicator "[!] Risk Indicator [+2 pts]: Virtual Location (IP Registration Location and Physical Location Mismatch) Suspected"
     detail "- Latency: ${PING_MS} (Registered Country: JP)"
     detail "- Reason: Despite being registered in Japan, the ping response is 90ms or higher. Due to the physical limitations of optical cables, the actual server is likely located overseas, and the Japanese IP is being used to disguise its location."
-    TOTAL_SCORE=$((TOTAL_SCORE + 2))
+    INFRA_SCORE=$((INFRA_SCORE + 2))
 fi
 
 # 小分けブロック (PA) (+1)
@@ -707,78 +720,151 @@ if echo "$IP_TYPE" | grep -qi "PA"; then
     indicator "[!] Risk Indicator [+1 pts]: IP Type is PA (Provider Aggregatable)"
     detail "- IP Type  : ${IP_TYPE}"
     detail "- Reason: This is a provider-aggregatable IP address, commonly used for reselling or re-selling purposes."
-    TOTAL_SCORE=$((TOTAL_SCORE + 1))
+    INFRA_SCORE=$((INFRA_SCORE + 1))
 fi
 
 # 一般回線特有の逆引きがない (+1)
-if [ "$PTR" = "None" ] && [ "$TOTAL_SCORE" -gt 0 ]; then
+if [ "$PTR" = "None" ] && [ "$INFRA_SCORE" -gt 0 ]; then
     indicator "[!] Risk Indicator [+1 pts]: No Reverse DNS (PTR) Record Found for Public Access Line"
     detail "- Reverse DNS Result: None"
     detail "- Reason: Major domestic ISPs typically assign PTR hostnames to dynamic/fixed IPs, but their absence suggests a high likelihood of server usage."
-    TOTAL_SCORE=$((TOTAL_SCORE + 1))
+    INFRA_SCORE=$((INFRA_SCORE + 1))
 fi
 
-# 匿名通信をしている (+5)
+# ------------------------------------------------------------
+# 脅威の評判（回線属性の減点で打ち消さない）
+# ------------------------------------------------------------
+echo ""
+echo "--- [3-2] Threat Reputation (not offset by infrastructure attributes) ---"
+THREAT_SIGNALS=()
+
+# Tor 出口ノード
 if [ "$TOR_HIT" -eq 1 ]; then
-    indicator "[!] Critical Risk [+5 pts]: Confirmed Tor Exit Node"
+    indicator "[X] Threat Signal: Confirmed Tor Exit Node"
     detail "- Evidence : Matched official Tor Project active exit list."
-    detail "- Rationale: Traffic is routed through onion encryption; 100% anonymized."
-    TOTAL_SCORE=$((TOTAL_SCORE + 5))
+    detail "- Rationale: Traffic is routed through onion encryption; the real source cannot be traced."
+    THREAT_SIGNALS+=("Tor Exit Node")
 fi
 
-# DNSBL登録あり (+4)  ※PBLのみの場合は加点しない
+# DNSBL 登録（PBL のみの場合は脅威とみなさない）
 if [ -n "$DNSBL_HIT" ]; then
-    indicator "[!] Critical Risk [+4 pts]: Public Threat Blacklist (DNSBL) listed"
+    indicator "[X] Threat Signal: Public Threat Blacklist (Spamhaus ${DNSBL_HIT})"
     detail "- Evidence : ${DNSBL_STATUS}"
-    detail "- Rationale: Known source of automated exploitation, spam, botnet, or open relay."
-    TOTAL_SCORE=$((TOTAL_SCORE + 4))
+    detail "- Rationale: Known source of spam, malware-infected hosts (botnet), abused proxies, or criminal networks."
+    THREAT_SIGNALS+=("Spamhaus ${DNSBL_HIT}")
 elif [ "$DNSBL_INFO" = "PBL" ]; then
-    indicator "[i] Info [0 pts]: Listed on Spamhaus PBL only"
+    indicator "[i] Info: Listed on Spamhaus PBL only"
     detail "- Reason : PBL lists end-user / dynamic IP ranges that should not send mail directly. Not a threat indicator."
+fi
+
+# 検索エンジンクローラーのなりすまし
+if [ "$SPOOFED_CRAWLER" -eq 1 ]; then
+    indicator "[X] Threat Signal: Spoofed Search Engine Crawler PTR"
+    detail "- Evidence : PTR='${PTR}' claims a crawler domain, but forward lookup does not return ${IP}"
+    detail "- Rationale: Reverse DNS is set to impersonate a legitimate crawler. Typical of scrapers evading bot controls."
+    THREAT_SIGNALS+=("Spoofed crawler PTR")
+fi
+
+if [ "${#THREAT_SIGNALS[@]}" -eq 0 ]; then
+    echo "No threat signals found in the checked sources (Tor exit list, Spamhaus ZEN, crawler PTR)."
+fi
+
+# ------------------------------------------------------------
+# 回線種別の分類
+# ------------------------------------------------------------
+if [ "$TOR_HIT" -eq 1 ]; then
+    INFRA_CLASS="Anonymization Network (Tor)"
+elif [ "$VERIFIED_CRAWLER" -eq 1 ]; then
+    INFRA_CLASS="Search Engine Crawler (verified)"
+elif [ "$SASE_HIT" -eq 1 ]; then
+    INFRA_CLASS="Enterprise SASE / Zero Trust Gateway"
+elif [ "$ISP_HIT" -eq 1 ] && [ "$DC_HIT" -eq 1 ]; then
+    INFRA_CLASS="Mixed (domestic ISP and hosting traits)"
+elif [ "$ISP_HIT" -eq 1 ]; then
+    INFRA_CLASS="Domestic Consumer ISP / Mobile"
+elif [ "$DC_HIT" -eq 1 ]; then
+    INFRA_CLASS="Datacenter / Hosting / Cloud"
+else
+    INFRA_CLASS="Unclassified"
+fi
+
+# ------------------------------------------------------------
+# 脅威の評判の判定（検出 / 未検出 / 判定不能）
+# ------------------------------------------------------------
+REPUTATION_INCOMPLETE=0
+for c in "${UNAVAILABLE_CHECKS[@]}"; do
+    case "$c" in "Tor Exit Node"|"DNSBL"*) REPUTATION_INCOMPLETE=1 ;; esac
+done
+if [ "${#THREAT_SIGNALS[@]}" -gt 0 ]; then
+    THREAT_LEVEL="DETECTED"
+    THREAT_TEXT="DETECTED ($(IFS=,; echo "${THREAT_SIGNALS[*]}" | sed 's/,/, /g'))"
+elif [ "$REPUTATION_INCOMPLETE" -eq 1 ]; then
+    THREAT_LEVEL="UNKNOWN"
+    THREAT_TEXT="UNKNOWN (some reputation checks could not be completed)"
+else
+    THREAT_LEVEL="NONE_FOUND"
+    THREAT_TEXT="NONE FOUND (in the checked sources only)"
 fi
 
 echo ""
 echo "================================================================================"
 echo "[4] Report Summary"
 echo "================================================================================"
-echo "Total Risk Score : ${TOTAL_SCORE} Points"
-if [ "${#UNAVAILABLE_CHECKS[@]}" -gt 0 ]; then
-    echo "Confidence       : PARTIAL - the following checks could not be completed:"
-    for c in "${UNAVAILABLE_CHECKS[@]}"; do
-        echo "                   - ${c}"
-    done
-    echo "                   The actual score may be higher than shown."
+
+# 調査優先度: 脅威シグナルがあれば回線種別に関係なく HIGH
+NEXT_STEPS=()
+if [ "$THREAT_LEVEL" = "DETECTED" ]; then
+    PRIORITY="HIGH"
+    FINDING="Threat reputation hit (${THREAT_SIGNALS[*]}). Treat as suspicious regardless of the infrastructure type."
+    if [ "$ISP_HIT" -eq 1 ]; then
+        FINDING="${FINDING} A domestic consumer line with a threat listing often indicates a compromised end-user device (botnet) or a residential proxy."
+    fi
+    NEXT_STEPS+=("Review application and authentication logs for this IP (request rate, paths, login failures, user agents).")
+    NEXT_STEPS+=("If malicious activity is confirmed, block this single IP first. Widen to the allocated CIDR only with additional evidence.")
+    NEXT_STEPS+=("If an attack is confirmed, report it to the abuse contact with log excerpts.")
+elif [ "$VERIFIED_CRAWLER" -eq 1 ] && [ "$INFRA_SCORE" -le 0 ]; then
+    PRIORITY="LOW"
+    FINDING="Verified search engine crawler (forward-confirmed reverse DNS)."
+    NEXT_STEPS+=("Do not block. If crawl load is a problem, use robots.txt or the search engine's crawl-rate settings.")
+elif [ "$INFRA_SCORE" -ge 4 ]; then
+    PRIORITY="HIGH"
+    FINDING="Multiple infrastructure anomalies. This is not a typical end-user access line."
+    NEXT_STEPS+=("Check whether this IP belongs to an expected service (monitoring, partner integration, your own cloud resources).")
+    NEXT_STEPS+=("If not expected, review its request patterns in the logs. Prefer rate limiting or a challenge over an outright block.")
+elif [ "$INFRA_SCORE" -ge 1 ]; then
+    PRIORITY="MEDIUM"
+    FINDING="Some non-consumer traits (e.g. cloud/hosting, PA allocation) were found, but not conclusive."
+    NEXT_STEPS+=("Check whether it is a known integration, an employee VPN, or a monitoring service.")
+    NEXT_STEPS+=("Review its request patterns in the logs (rate, paths, user agents).")
 else
-    echo "Confidence       : FULL - all checks completed"
+    PRIORITY="LOW"
+    FINDING="No infrastructure anomalies found. This does NOT mean the access is safe: compromised end-user devices and residential proxies look exactly like this."
+    NEXT_STEPS+=("Judge by behavior in the logs: login failures, unusual paths, request rate, and user agents.")
+fi
+if [ "$THREAT_LEVEL" = "UNKNOWN" ]; then
+    NEXT_STEPS+=("Threat reputation could not be fully checked. Re-run with a working resolver / network before concluding.")
+fi
+RESULT_LABEL="PRIORITY ${PRIORITY} / ${INFRA_CLASS}"
+
+echo "Investigation Priority : ${PRIORITY}"
+echo "Infrastructure Class   : ${INFRA_CLASS}"
+echo "Infrastructure Score   : ${INFRA_SCORE} Points"
+echo "Threat Reputation      : ${THREAT_TEXT}"
+if [ "${#UNAVAILABLE_CHECKS[@]}" -gt 0 ]; then
+    echo "Confidence             : PARTIAL - the following checks could not be completed:"
+    for c in "${UNAVAILABLE_CHECKS[@]}"; do
+        echo "                         - ${c}"
+    done
+else
+    echo "Confidence             : FULL - all checks completed"
 fi
 echo "--------------------------------------------------------------------------------"
-
-if [ "$VERIFIED_CRAWLER" -eq 1 ] && [ "$TOTAL_SCORE" -le 0 ]; then
-    RESULT_LABEL="LOW RISK / VERIFIED SEARCH ENGINE CRAWLER"
-    echo "Test Result     : ${RESULT_LABEL}"
-    echo "Assessment      : Forward-confirmed reverse DNS matches an official search engine crawler domain."
-    echo "Note            : Do not block unless crawl rate is a problem; control it via robots.txt or crawl-rate settings instead."
-
-elif [ "$TOTAL_SCORE" -le 0 ]; then
-    RESULT_LABEL="LOW RISK / RESIDENTIAL OR ENTERPRISE ACCESS"
-    echo "Test Result     : ${RESULT_LABEL}"
-    echo "Assessment      : Originates from a domestic ISP or verified enterprise SASE. No anonymization detected."
-    echo "Note            : It is highly likely that this is a line used by general end users on a daily basis."
-
-elif [ "$TOTAL_SCORE" -ge 4 ]; then
-    RESULT_LABEL="HIGH RISK / PROXY, DATACENTER, OR ANONYMIZED ACCESS"
-    echo "Test Result     : ${RESULT_LABEL}"
-    echo "Assessment      : Multiple indicators detected (datacenter line, IP sub-lease, or offshore routing)."
-    echo "Note            : Extremely unlikely to be direct access from an authentic domestic end-user."
-
-else
-    RESULT_LABEL="MEDIUM RISK / ATTRIBUTE UNKNOWN / MONITORING REQUIRED"
-    echo "Test Result     : ${RESULT_LABEL}"
-    echo "Assessment      : Exhibits non-consumer traits (cloud/hosting traits or PA allocation), but unconfirmed."
-    echo "Note            : Potential unapproved personal VPN, web crawler, or automated scraper."
-fi
+echo "Finding    : ${FINDING}"
+echo "Next Steps :"
+for step in "${NEXT_STEPS[@]}"; do
+    echo "  - ${step}"
+done
 echo "================================================================================"
-
 echo ""
 echo "================================================================================"
 echo "[5] Data Sources"
@@ -847,8 +933,12 @@ if [ "$JSON_MODE" -eq 1 ]; then
   "emails": $(jarr "$ALL_EMAILS"),
   "indicators": [${IND_OUT}],
   "summary": {
-    "score": ${TOTAL_SCORE},
+    "priority": $(jstr "$PRIORITY"),
     "result": $(jstr "$RESULT_LABEL"),
+    "infrastructure": {"class": $(jstr "$INFRA_CLASS"), "score": ${INFRA_SCORE}},
+    "threat": {"level": $(jstr "$THREAT_LEVEL"), "signals": $(jarr "$(printf '%s\n' "${THREAT_SIGNALS[@]}")")},
+    "finding": $(jstr "$FINDING"),
+    "next_steps": $(jarr "$(printf '%s\n' "${NEXT_STEPS[@]}")"),
     "confidence": $(jstr "$CONFIDENCE"),
     "unavailable_checks": $(jarr "$UNAVAIL_LIST")
   },
