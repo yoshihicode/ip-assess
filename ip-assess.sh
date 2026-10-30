@@ -27,16 +27,74 @@ if [ "$HTTP_STATUS" != "200" ]; then
 fi
 echo "Retrieval Status: Success (HTTP 200)"
 
-# 逆引き(PTR)
+# 判定不能だった項目の記録（スコアの信頼性表示に使用）
+UNAVAILABLE_CHECKS=()
+
+# 汎用DNS問い合わせ
+#   引数: レコード種別 (A / PTR) と名前
+#   戻り値: 標準出力にレコード値（改行区切り、末尾ドット除去）。終了コード 0=取得成功 / 1=該当なし / 2=問い合わせ失敗
+dns_query() {
+    local type="$1" qname="$2" out status
+    if command -v dig >/dev/null 2>&1; then
+        out=$(dig +time=3 +tries=1 "$type" "$qname" 2>/dev/null)
+        status=$(echo "$out" | awk '/status:/ {gsub(",","",$6); print $6; exit}')
+        case "$status" in
+            NOERROR)
+                out=$(echo "$out" | awk -v t="$type" '$4==t {print $5}' | sed 's/\.$//')
+                [ -n "$out" ] || return 1
+                echo "$out"
+                return 0 ;;
+            NXDOMAIN) return 1 ;;
+            *) return 2 ;;
+        esac
+    elif command -v host >/dev/null 2>&1; then
+        out=$(host -W 3 -t "$type" "$qname" 2>&1)
+        if echo "$out" | grep -qE "domain name pointer|has address"; then
+            echo "$out" | awk '/domain name pointer|has address/ {print $NF}' | sed 's/\.$//'
+            return 0
+        elif echo "$out" | grep -qE "NXDOMAIN|has no .* record"; then
+            return 1
+        fi
+        return 2
+    fi
+    return 2
+}
+
+# 逆引き(PTR) と FCrDNS（Forward-Confirmed reverse DNS）
+#   PTRは IP の管理者が自由に設定できるため、正引きで元のIPに戻ることを確認して初めて信頼できる
 PTR="None"
-if command -v host >/dev/null 2>&1; then
-    PTR=$(host "${IP}" 2>/dev/null | awk '{print $NF}' | sed 's/\.$//')
-elif command -v dig >/dev/null 2>&1; then
-    PTR=$(dig -x "${IP}" +short 2>/dev/null | sed 's/\.$//')
-elif command -v nslookup >/dev/null 2>&1; then
-    PTR=$(nslookup "${IP}" 2>/dev/null | awk -F'= ' '/name =/ {print $2}' | sed 's/\.$//')
+PTR_ALL=""
+PTR_VERIFIED=0
+FCRDNS_STATUS="N/A (No PTR)"
+REV_ARPA=$(echo "$IP" | awk -F'.' '{print $4"."$3"."$2"."$1".in-addr.arpa"}')
+
+PTR_ALL=$(dns_query PTR "$REV_ARPA")
+PTR_RC=$?
+if [ "$PTR_RC" -eq 0 ]; then
+    PTR=$(echo "$PTR_ALL" | head -n1)
+    FCRDNS_STATUS="Not verified (forward lookup does not return ${IP})"
+    FWD_FAILED=0
+    for name in $PTR_ALL; do
+        FWD=$(dns_query A "$name")
+        rc=$?
+        if [ "$rc" -eq 0 ] && echo "$FWD" | grep -qx "$IP"; then
+            PTR="$name"
+            PTR_VERIFIED=1
+            FCRDNS_STATUS="Verified (${name} -> ${IP})"
+            break
+        fi
+        [ "$rc" -eq 2 ] && FWD_FAILED=1
+    done
+    if [ "$PTR_VERIFIED" -eq 0 ] && [ "$FWD_FAILED" -eq 1 ]; then
+        FCRDNS_STATUS="Unknown (forward lookup failed)"
+        UNAVAILABLE_CHECKS+=("FCrDNS")
+    fi
+elif [ "$PTR_RC" -eq 2 ]; then
+    PTR="Unknown (DNS query failed / dig or host not found)"
+    FCRDNS_STATUS="Unknown"
+    UNAVAILABLE_CHECKS+=("Reverse DNS (PTR)")
 fi
-[ -z "$PTR" ] && PTR="None"
+PTR_COUNT=$(echo "$PTR_ALL" | grep -c .)
 
 # Pingレイテンシ測定
 PING_MS=""
@@ -52,9 +110,6 @@ if command -v ping >/dev/null 2>&1; then
 else
     PING_STR="Command not found"
 fi
-
-# 判定不能だった項目の記録（スコアの信頼性表示に使用）
-UNAVAILABLE_CHECKS=()
 
 # Tor（匿名通信）のチェック
 #   取得失敗時に「No」と誤表示しないよう、リスト取得の成否を先に確認する
@@ -260,7 +315,8 @@ echo "RIR                    : ${RIR}"
 echo "RIR Country            : ${RIR_COUNTRY}"
 echo "Admin Physical Address : ${ADDRESS}"
 echo "Remarks                : ${REMARKS}"
-echo "Reverse DNS (PTR)      : ${PTR}"
+echo "Reverse DNS (PTR)      : ${PTR}$( [ "$PTR_COUNT" -gt 1 ] && echo " (+$((PTR_COUNT - 1)) more)")"
+echo "FCrDNS                 : ${FCRDNS_STATUS}"
 echo "Ping Latency           : ${PING_STR}"
 echo "Tor Exit Node          : ${TOR_STATUS}"
 echo "DNSBL Status           : ${DNSBL_STATUS}"
@@ -288,25 +344,53 @@ echo "[3] Risk Analysis & Scoring"
 echo "================================================================================"
 
 TOTAL_SCORE=0
+VERIFIED_CRAWLER=0
 METADATA_LOWER=$(echo "${NET_NAME} ${ALL_FNS} ${REMARKS} ${DOMAINS} ${ADDRESS}" | tr '[:upper:]' '[:lower:]')
-PTR_LOWER=$(echo "${PTR}" | tr '[:upper:]' '[:lower:]')
+PTR_LOWER=""
+[ "$PTR_RC" -eq 0 ] && PTR_LOWER=$(echo "${PTR}" | tr '[:upper:]' '[:lower:]')
+# 減点（安全側）の判定には、なりすまし防止のため FCrDNS 検証済みの PTR のみを使う
+PTR_TRUSTED_LOWER=""
+[ "$PTR_VERIFIED" -eq 1 ] && PTR_TRUSTED_LOWER="$PTR_LOWER"
 
 # ------------------------------------------------------------
 # 減点要因: 安全な正規通信の検証
 # ------------------------------------------------------------
+# 検索エンジンの正規クローラー（FCrDNS検証済みPTRで判定）
+#   各社公式の検証方法に準拠: 逆引き → ドメイン確認 → 正引きで元IPに戻ることを確認
+#   ※googleusercontent.com は GCP の利用者VMも含むため対象外
+CRAWLER_REGEX="(\.googlebot\.com|\.google\.com|\.search\.msn\.com|\.applebot\.apple\.com|\.yandex\.(ru|net|com)|\.baidu\.(com|jp))$"
+if echo "$PTR_LOWER" | grep -qE "$CRAWLER_REGEX"; then
+    if [ "$PTR_VERIFIED" -eq 1 ]; then
+        echo "[o] Safe Indicator [-5 pts]: Verified Search Engine Crawler"
+        echo "    - Evidence : FCrDNS-verified PTR='${PTR}'"
+        echo "    - Reason : Officially verifiable crawler. Blocking may affect search indexing (SEO)."
+        TOTAL_SCORE=$((TOTAL_SCORE - 5))
+        VERIFIED_CRAWLER=1
+    elif [[ "$FCRDNS_STATUS" == Not\ verified* ]]; then
+        echo "[!] Risk Indicator [+3 pts]: Spoofed Search Engine Crawler PTR"
+        echo "    - Evidence : PTR='${PTR}' claims a crawler domain, but forward lookup does not return ${IP}"
+        echo "    - Reason : Reverse DNS is set to impersonate a legitimate crawler. Typical of scrapers evading bot controls."
+        TOTAL_SCORE=$((TOTAL_SCORE + 3))
+    fi
+fi
+
 # A. 国内一般通信キャリア・ISP・モバイル
 ISP_REGEX="(ocn\.ne\.jp|kddi\.ne\.jp|bbtec\.net|mesh\.ad\.jp|plala\.or\.jp|so-net\.ne\.jp|eonet\.ne\.jp|flets|spmode\.ne\.jp|au-net\.ne\.jp|rmobile\.jp|panda-world|nuro\.jp|biglobe\.ne\.jp|iij\.ad\.jp|iijmio|zaq\.ne\.jp|asahi-net|commufa\.jp|bbiq\.jp|megaegg\.ne\.jp|pikara\.ne\.jp|dion\.ne\.jp|vectant|ucom|open-cgn)"
-if echo "$PTR_LOWER" | grep -qEi "$ISP_REGEX" || echo "$METADATA_LOWER" | grep -qEi "(ntt communications|kddi corporation|softbank corp|rakuten mobile|internet initiative japan|biglobe)"; then
+if echo "$PTR_TRUSTED_LOWER" | grep -qEi "$ISP_REGEX" || echo "$METADATA_LOWER" | grep -qEi "(ntt communications|kddi corporation|softbank corp|rakuten mobile|internet initiative japan|biglobe)"; then
     echo "[o] Safe Indicator [-5 pts]: Domestic Consumer ISP / Mobile Carrier detected"
-    echo "    - Evidence : PTR='${PTR}' or Domestic ISP found in Organization Metadata"
+    if echo "$PTR_TRUSTED_LOWER" | grep -qEi "$ISP_REGEX"; then
+        echo "    - Evidence : FCrDNS-verified PTR='${PTR}'"
+    else
+        echo "    - Evidence : Domestic ISP found in Organization Metadata"
+    fi
     echo "    - Reason : This is a regular access line used directly by general users in their daily lives."
     TOTAL_SCORE=$((TOTAL_SCORE - 5))
 fi
 
 # B. 企業向け SASE / 業務 VPN
 SASE_REGEX="(cato networks|zscaler|cloudflare|netskope|prisma access|palo alto networks|cisco umbrella|iboss|skyhigh|menlo security|forcepoint)"
-if echo "$METADATA_LOWER" | grep -qEi "$SASE_REGEX" || echo "$PTR_LOWER" | grep -qEi "$SASE_REGEX"; then
-    DETECTED_SASE=$(echo "$METADATA_LOWER $PTR_LOWER" | grep -oEi "$SASE_REGEX" | head -n 1)
+if echo "$METADATA_LOWER" | grep -qEi "$SASE_REGEX" || echo "$PTR_TRUSTED_LOWER" | grep -qEi "$SASE_REGEX"; then
+    DETECTED_SASE=$(echo "$METADATA_LOWER $PTR_TRUSTED_LOWER" | grep -oEi "$SASE_REGEX" | head -n 1)
     echo "[o] Safe Indicator [-5 pts]: Enterprise SASE / Zero Trust Gateway detected"
     echo "    - Evidence: Vendor matched ${DETECTED_SASE}"
     echo "    - Reason  : The enterprise's business devices are relaying legitimate traffic based on internal policies."
@@ -417,7 +501,12 @@ else
 fi
 echo "--------------------------------------------------------------------------------"
 
-if [ "$TOTAL_SCORE" -le 0 ]; then
+if [ "$VERIFIED_CRAWLER" -eq 1 ] && [ "$TOTAL_SCORE" -le 0 ]; then
+    echo "Test Result     : LOW RISK / VERIFIED SEARCH ENGINE CRAWLER"
+    echo "Assessment      : Forward-confirmed reverse DNS matches an official search engine crawler domain."
+    echo "Note            : Do not block unless crawl rate is a problem; control it via robots.txt or crawl-rate settings instead."
+
+elif [ "$TOTAL_SCORE" -le 0 ]; then
     echo "Test Result     : LOW RISK / RESIDENTIAL OR ENTERPRISE ACCESS"
     echo "Assessment      : Originates from a domestic ISP or verified enterprise SASE. No anonymization detected."
     echo "Note            : It is highly likely that this is a line used by general end users on a daily basis."
