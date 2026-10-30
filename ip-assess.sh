@@ -138,6 +138,68 @@ elif [ "$SPAMHAUS_RC" -eq 0 ]; then
     fi
 fi
 
+# ASN / BGPプレフィックスの取得（Team Cymru IP to ASN Mapping, DNS経由）
+#   <逆順IP>.origin.asn.cymru.com TXT -> "ASN | BGP Prefix | CC | Registry | Allocated"
+#   AS<番号>.asn.cymru.com TXT        -> "ASN | CC | Registry | Allocated | AS Name"
+ASN="Unknown"
+AS_NAME="Unknown"
+BGP_PREFIX="Unknown"
+ASN_CC="Unknown"
+
+# 戻り値: 標準出力にTXTレコード（引用符除去済み）。終了コード 0=取得成功 / 1=該当なし / 2=問い合わせ失敗
+query_txt() {
+    local qname="$1" out status
+    if command -v dig >/dev/null 2>&1; then
+        out=$(dig +time=3 +tries=1 TXT "$qname" 2>/dev/null)
+        status=$(echo "$out" | awk '/status:/ {gsub(",","",$6); print $6; exit}')
+        case "$status" in
+            NOERROR)
+                out=$(echo "$out" | awk '$4=="TXT"' | sed -E 's/^[^"]*"//; s/"[^"]*$//')
+                [ -n "$out" ] || return 1
+                echo "$out"
+                return 0 ;;
+            NXDOMAIN) return 1 ;;
+            *) return 2 ;;
+        esac
+    elif command -v host >/dev/null 2>&1; then
+        out=$(host -W 3 -t TXT "$qname" 2>&1)
+        if echo "$out" | grep -q "descriptive text"; then
+            echo "$out" | awk -F'descriptive text ' '/descriptive text/ {print $2}' | tr -d '"'
+            return 0
+        elif echo "$out" | grep -qE "NXDOMAIN|has no TXT record"; then
+            return 1
+        fi
+        return 2
+    fi
+    return 2
+}
+
+ORIGIN_RES=$(query_txt "${REV_IP}.origin.asn.cymru.com")
+ORIGIN_RC=$?
+if [ "$ORIGIN_RC" -eq 0 ]; then
+    # 複数オリジン（MOAS）の場合は最も細かいプレフィックスを採用
+    ORIGIN_LINE=$(echo "$ORIGIN_RES" | awk -F'|' '{split($2,a,"/"); gsub(/ /,"",a[2]); print a[2]"\t"$0}' | sort -rn | head -n1 | cut -f2-)
+    ASN=$(echo "$ORIGIN_LINE" | awk -F'|' '{gsub(/ /,"",$1); print $1}' | awk '{print $1}')
+    BGP_PREFIX=$(echo "$ORIGIN_LINE" | awk -F'|' '{gsub(/ /,"",$2); print $2}')
+    ASN_CC=$(echo "$ORIGIN_LINE" | awk -F'|' '{gsub(/ /,"",$3); print $3}')
+    # 同一ASの包含プレフィックスは除き、異なるオリジンAS（MOAS）のみ数える
+    OTHER_ASNS=$(echo "$ORIGIN_RES" | awk -F'|' '{gsub(/ /,"",$1); print $1}' | tr ' ' '\n' | grep -v "^${ASN}$" | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')
+    [ -n "$OTHER_ASNS" ] && ASN="${ASN} (also announced by AS: ${OTHER_ASNS})"
+
+    ASN_NUM=$(echo "$ASN" | awk '{print $1}')
+    NAME_RES=$(query_txt "AS${ASN_NUM}.asn.cymru.com")
+    if [ $? -eq 0 ]; then
+        AS_NAME=$(echo "$NAME_RES" | head -n1 | awk -F'|' '{print $5}' | sed -E 's/^ +| +$//g')
+    fi
+elif [ "$ORIGIN_RC" -eq 1 ]; then
+    ASN="Not announced (no BGP route)"
+    BGP_PREFIX="None"
+else
+    ASN="Unknown (DNS query failed)"
+    UNAVAILABLE_CHECKS+=("ASN Lookup (Team Cymru)")
+fi
+ASN_NUM=$(echo "$ASN" | grep -oE '^[0-9]+')
+
 # JSONパース
 NET_NAME=$(grep -oEi '"name"\s*:\s*"[^"]+"' "${TMP_FILE}" | head -n 1 | sed -E 's/.*:\s*"([^"]+)".*/\1/')
 COUNTRY=$(grep -oEi '"country"\s*:\s*"[^"]+"' "${TMP_FILE}" | head -n 1 | sed -E 's/.*:\s*"([^"]+)".*/\1/')
@@ -202,6 +264,10 @@ echo "Reverse DNS (PTR)      : ${PTR}"
 echo "Ping Latency           : ${PING_STR}"
 echo "Tor Exit Node          : ${TOR_STATUS}"
 echo "DNSBL Status           : ${DNSBL_STATUS}"
+echo "ASN                    : ${ASN}"
+echo "AS Name                : ${AS_NAME}"
+echo "BGP Prefix             : ${BGP_PREFIX}"
+echo "ASN Registered Country : ${ASN_CC}"
 echo ""
 echo "--- Associated Organizations / Contacts ---"
 echo "$ALL_FNS" | while read -r fn; do
@@ -251,11 +317,26 @@ fi
 # 加点要因: リスク要素の検証
 # ------------------------------------------------------------
 # データセンター / クラウド / ホスティング (+3)
+#   根拠1: 既知のホスティング事業者ASN（キーワードより確度が高い）
+#   根拠2: 登録情報・PTRのキーワード
+#   ※Cloudflare(13335)はSASE/WARPの切り分けが別途必要なため、ここには含めない
+HOSTING_ASNS=" 16509 14618 8075 396982 31898 45102 132203 14061 63949 20473 16276 24940 51167 60781 28753 9009 7684 9370 9371 7506 "
 DC_REGEX="(hydra|zare|arisk|m-square|digitalocean|linode|vultr|choopa|ovh|equinix|hetzner|leaseweb|contabo|hostinger|sakura|conoha|gmo internet|xserver|amazon|aws|microsoft|azure|google cloud|alicloud|alibaba|tencent|hosting|cloud|datacenter|server|colocation|vps)"
+DC_ASN_HIT=0
+DC_KEYWORD_HIT=0
+[ -n "$ASN_NUM" ] && [[ "$HOSTING_ASNS" == *" ${ASN_NUM} "* ]] && DC_ASN_HIT=1
 if echo "$METADATA_LOWER" | grep -qEi "$DC_REGEX" || echo "$PTR_LOWER" | grep -qEi "(compute\.amazonaws|googleusercontent|cloudapp\.net|vultrusercontent)"; then
-    DETECTED_DC=$(echo "$METADATA_LOWER $PTR_LOWER" | grep -oEi "$DC_REGEX" | head -n 3 | tr '\n' ' ')
+    DC_KEYWORD_HIT=1
+fi
+if [ "$DC_ASN_HIT" -eq 1 ] || [ "$DC_KEYWORD_HIT" -eq 1 ]; then
     echo "[!] Risk Indicator [+3 pts]: Datacenter / Hosting / Cloud infrastructure detected"
-    echo "    - Evidence: Keywords matched ${DETECTED_DC}"
+    if [ "$DC_ASN_HIT" -eq 1 ]; then
+        echo "    - Evidence: Known hosting ASN matched AS${ASN_NUM} (${AS_NAME})"
+    fi
+    if [ "$DC_KEYWORD_HIT" -eq 1 ]; then
+        DETECTED_DC=$(echo "$METADATA_LOWER $PTR_LOWER" | grep -oEi "$DC_REGEX" | head -n 3 | tr '\n' ' ')
+        echo "    - Evidence: Keywords matched ${DETECTED_DC}"
+    fi
     echo "    - Reason: This is a datacenter, hosting, or cloud infrastructure which is not typically used by individual consumers."
     TOTAL_SCORE=$((TOTAL_SCORE + 3))
 fi
