@@ -5,7 +5,7 @@
 # ============================================================
 
 SCRIPT_NAME="ip-assess"
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 
 usage() {
     echo "Usage: $0 [--json] <IPv4_ADDRESS>"
@@ -475,6 +475,74 @@ ABUSE_CONTACTS=$(echo "$RDAP_FLAT" | awk -F'\t' '
 
 [ -z "$NET_NAME" ] && NET_NAME="Unknown"
 [ -z "$COUNTRY" ] && COUNTRY="Unknown"
+
+# ------------------------------------------------------------
+# Geofeed（運営者が自己申告する利用地: RFC 8805 / RFC 9632）
+#   1. RDAP の links に rel=geofeed があればその URL
+#   2. なければ remarks の "Geofeed https://..." 形式
+#   取得した CSV から、対象 IP を含む最も細かいプレフィックスの行を採用する
+# ------------------------------------------------------------
+GEOFEED_URL=$(echo "$RDAP_FLAT" | awk -F'\t' '
+    $1 ~ /^\.links\[[0-9]+\]\.rel$/ && $2 == "geofeed" { k = $1; sub(/\.rel$/, "", k); want[k] = 1 }
+    $1 ~ /^\.links\[[0-9]+\]\.href$/ { k = $1; sub(/\.href$/, "", k); href[k] = $2 }
+    END { for (k in want) if (k in href) { print href[k]; exit } }')
+if [ -z "$GEOFEED_URL" ]; then
+    GEOFEED_URL=$(echo "$RDAP_FLAT" | awk -F'\t' '$1 ~ /^\.remarks\[[0-9]+\]\.description\[[0-9]+\]$/' \
+        | grep -oE 'Geofeed:?[[:space:]]+https://[^[:space:]]+' | head -n1 | grep -oE 'https://[^[:space:]]+')
+fi
+# 外部（RDAP登録者）が書いた値なので、https の URL 以外は使わない
+GEOFEED_URL_RE='^https://[A-Za-z0-9._~:/?#@!&()*+,;=%-]+$'
+if ! [[ "$GEOFEED_URL" =~ $GEOFEED_URL_RE ]]; then
+    GEOFEED_URL=""
+fi
+
+GEOFEED_STATUS="Not published"
+GEOFEED_PREFIX=""
+GEOFEED_CC=""
+GEOFEED_REGION=""
+GEOFEED_CITY=""
+if [ -n "$GEOFEED_URL" ]; then
+    GEOFEED_TMP=$(mktemp 2>/dev/null || echo "/tmp/geofeed_${IP}_$$.csv")
+    if curl -sfL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 20 \
+            --max-filesize 50000000 -o "$GEOFEED_TMP" "$GEOFEED_URL" 2>/dev/null && [ -s "$GEOFEED_TMP" ]; then
+        GEOFEED_LINE=$(awk -F',' -v ip="$IP" '
+            function ip2n(s,   a) { split(s, a, "."); return ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4] }
+            BEGIN { t = ip2n(ip); best = -1 }
+            /^[ \t]*#/ { next }
+            {
+                gsub(/\r/, "")
+                p = $1; gsub(/^[ \t]+|[ \t]+$/, "", p)
+                if (p !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?$/) next
+                n = split(p, q, "/"); len = (n == 2) ? q[2] + 0 : 32
+                if (len > 32) next
+                size = 1; for (k = 0; k < 32 - len; k++) size *= 2   # busybox awk はべき乗非対応のことがある
+                if (int(t / size) == int(ip2n(q[1]) / size) && len > best) { best = len; line = $0 }
+            }
+            END { if (best >= 0) print line }' "$GEOFEED_TMP")
+        if [ -n "$GEOFEED_LINE" ]; then
+            GEOFEED_STATUS="Found"
+            GEOFEED_PREFIX=$(echo "$GEOFEED_LINE" | awk -F',' '{gsub(/^[ \t]+|[ \t]+$/,"",$1); print $1}')
+            GEOFEED_CC=$(echo "$GEOFEED_LINE" | awk -F',' '{gsub(/^[ \t]+|[ \t]+$/,"",$2); print toupper($2)}')
+            GEOFEED_REGION=$(echo "$GEOFEED_LINE" | awk -F',' '{gsub(/^[ \t]+|[ \t]+$/,"",$3); print $3}')
+            GEOFEED_CITY=$(echo "$GEOFEED_LINE" | awk -F',' '{gsub(/^[ \t]+|[ \t]+$/,"",$4); print $4}')
+        else
+            GEOFEED_STATUS="Prefix not listed"
+        fi
+    else
+        GEOFEED_STATUS="Unknown (failed to fetch)"
+        UNAVAILABLE_CHECKS+=("Geofeed")
+    fi
+    rm -f "$GEOFEED_TMP"
+fi
+
+if [ "$GEOFEED_STATUS" = "Found" ]; then
+    GEOFEED_TEXT="${GEOFEED_CC:--}"
+    [ -n "$GEOFEED_REGION" ] && GEOFEED_TEXT="${GEOFEED_TEXT} / ${GEOFEED_REGION}"
+    [ -n "$GEOFEED_CITY" ] && GEOFEED_TEXT="${GEOFEED_TEXT} / ${GEOFEED_CITY}"
+    GEOFEED_TEXT="${GEOFEED_TEXT} (${GEOFEED_PREFIX}, self-declared by operator)"
+else
+    GEOFEED_TEXT="$GEOFEED_STATUS"
+fi
 [ -z "$IP_TYPE" ] && IP_TYPE="Unknown"
 [ -z "$PORT43" ] && PORT43="Unknown"
 
@@ -517,6 +585,22 @@ DOMAIN_COUNT=$(echo "$DOMAINS" | grep -c .)
 ALL_FNS=$(grep -oEi '"fn"\s*,\s*\{[^}]*\}\s*,\s*"text"\s*,\s*"[^"]+"' "${TMP_FILE}" | sed -E 's/.*"([^"]+)"$/\1/' | sort -u)
 
 echo ""
+# 所在地の整合性チェック（登録国・申告所在地・遅延の突き合わせ）
+#   遅延の閾値（90ms）は日本国内から実行する前提
+DECLARED_JP=0
+{ [ "$COUNTRY" = "JP" ] || [ "$GEOFEED_CC" = "JP" ]; } && DECLARED_JP=1
+if [ -n "$GEOFEED_CC" ] && [ "$COUNTRY" != "Unknown" ] && [ "$GEOFEED_CC" != "$COUNTRY" ]; then
+    LOCATION_CHECK="DECLARATIONS DIFFER (RDAP: ${COUNTRY} / Geofeed: ${GEOFEED_CC})"
+elif [ "$DECLARED_JP" -eq 1 ] && [ -n "$PING_MS" ] && [ "$PING_VAL" -ge 90 ]; then
+    LOCATION_CHECK="MISMATCH (declared JP, but latency is ${PING_MS} ms)"
+elif [ "$DECLARED_JP" -eq 1 ] && [ -n "$PING_MS" ]; then
+    LOCATION_CHECK="CONSISTENT (declared JP, latency ${PING_MS} ms)"
+elif [ -z "$PING_MS" ]; then
+    LOCATION_CHECK="NOT VERIFIED (no latency measurement)"
+else
+    LOCATION_CHECK="NOT EVALUATED (latency threshold is defined for JP only)"
+fi
+
 echo "================================================================================"
 echo "[2] Network Information"
 echo "================================================================================"
@@ -535,6 +619,8 @@ echo "Remarks                : ${REMARKS}"
 echo "Reverse DNS (PTR)      : ${PTR}$( [ "$PTR_COUNT" -gt 1 ] && echo " (+$((PTR_COUNT - 1)) more)")"
 echo "FCrDNS                 : ${FCRDNS_STATUS}"
 echo "Ping Latency           : ${PING_STR}"
+echo "Geofeed Location       : ${GEOFEED_TEXT}"
+echo "Location Check         : ${LOCATION_CHECK}"
 echo "Tor Exit Node          : ${TOR_STATUS}"
 echo "DNSBL Status           : ${DNSBL_STATUS}"
 echo "ASN                    : ${ASN}"
@@ -708,9 +794,9 @@ if echo "$ADDRESS" | grep -qEi "(suite\s+[0-9]|ste\.?\s+[0-9]|po\s*box|private\s
 fi
 
 # 仮想ロケーション疑い (+2)
-if [ "$PING_VAL" -ge 90 ] && [ "$COUNTRY" = "JP" ]; then
+if [ "$PING_VAL" -ge 90 ] && [ "$DECLARED_JP" -eq 1 ]; then
     indicator "[!] Risk Indicator [+2 pts]: Virtual Location (IP Registration Location and Physical Location Mismatch) Suspected"
-    detail "- Latency: ${PING_MS} (Registered Country: JP)"
+    detail "- Latency: ${PING_MS} ms (Registered Country: ${COUNTRY} / Geofeed: ${GEOFEED_TEXT})"
     detail "- Reason: Despite being registered in Japan, the ping response is 90ms or higher. Due to the physical limitations of optical cables, the actual server is likely located overseas, and the Japanese IP is being used to disguise its location."
     INFRA_SCORE=$((INFRA_SCORE + 2))
 fi
@@ -852,6 +938,7 @@ echo "Tor Exit List    : https://check.torproject.org/torbulkexitlist"
 echo "DNSBL            : zen.spamhaus.org (via ${DNS_RESOLVER})"
 echo "ASN              : Team Cymru IP to ASN Mapping (origin.asn.cymru.com / asn.cymru.com)"
 echo "Reverse/Forward  : DNS via ${DNS_RESOLVER}"
+echo "Geofeed          : ${GEOFEED_URL:-Not published}"
 echo "RDAP Raw Data    : ${TMP_FILE}"
 echo "================================================================================"
 
@@ -904,6 +991,17 @@ if [ "$JSON_MODE" -eq 1 ]; then
     "fcrdns_verified": $( [ "$PTR_VERIFIED" -eq 1 ] && echo true || echo false )
   },
   "ping_ms": ${PING_JSON},
+  "location": {
+    "registered_country": $(jstr "$COUNTRY"),
+    "geofeed": {
+      "status": $(jstr "$GEOFEED_STATUS"),
+      "prefix": $(jstr "$GEOFEED_PREFIX"),
+      "country": $(jstr "$GEOFEED_CC"),
+      "region": $(jstr "$GEOFEED_REGION"),
+      "city": $(jstr "$GEOFEED_CITY")
+    },
+    "check": $(jstr "$LOCATION_CHECK")
+  },
   "tor_exit_node": $(jstr "$TOR_STATUS"),
   "dnsbl": $(jstr "$DNSBL_STATUS"),
   "abuse_contacts": $(jarr "$ABUSE_EMAILS"),
@@ -925,6 +1023,7 @@ if [ "$JSON_MODE" -eq 1 ]; then
     "dnsbl": "zen.spamhaus.org",
     "asn": "Team Cymru IP to ASN Mapping",
     "dns_resolver": $(jstr "$DNS_RESOLVER"),
+    "geofeed": $(jstr "$GEOFEED_URL"),
     "rdap_raw_file": $(jstr "$TMP_FILE")
   }
 }

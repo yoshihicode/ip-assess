@@ -55,7 +55,7 @@
 | **警戒** | **Datacenter / Hosting / Cloud** | **+3** | AWS、Azure、さくら、ConoHa、海外ホスティング（Zare/Hydra等）。既知のホスティング事業者 ASN、または登録情報・PTR のキーワードで判定。一般端末ではなくサーバー設備帯域であり、ボットや中継プロキシの温床となるため。 |
 | **警戒** | **IP Sub-leasing / Domain Discrepancy** | **+3** | レジストリ契約組織（LIR）と運用担当組織のドメインが不一致。海外プロキシ業者への又貸し・再販が行われており、真の発信元追跡を困難にするため。 |
 | **警戒** | **Virtual Office / PO Box Address** | **+2** | 管理者住所に私書箱（Suite, PO Box）表記。実体オフィスを持たないペーパーカンパニーや不審事業者が身元隠蔽に多用するため。 |
-| **警戒** | **Suspected Virtual Location** | **+2** | 登録国が JP であるにもかかわらず Ping 応答が 90ms 以上。光速度の物理限界から、実機が欧米等の海外に存在し日本拠点を偽装しているため。 |
+| **警戒** | **Suspected Virtual Location** | **+2** | RDAP の登録国、または Geofeed の申告所在地が JP であるにもかかわらず Ping 応答が 90ms 以上。光速度の物理限界から、実機が欧米等の海外に存在し日本拠点を偽装しているため。※日本国内から実行する前提 |
 | **警戒** | **Provider Aggregatable (PA) Block** | **+1** | エンドユーザーへ小分けして再販・貸出を行うための IP アドレス枠であるため。 |
 | **警戒** | **Missing Consumer Reverse DNS (PTR)** | **+1** | 国内大手 ISP 特有のホスト名が付与されておらず、サーバー・データセンター用静的 IP の特徴を持つため。※他の警戒項目で加点済みの場合のみ |
 
@@ -104,21 +104,42 @@
 | 通常の LOW | LOW は安全という意味ではない。マルウェアに感染した端末や住宅用プロキシ（一般家庭の回線を中継に使うサービス）も同じように見える |
 | 検証済みクローラー | 遮断すると検索インデックスに影響する |
 
+### 所在地の整合性チェック
+IP の所在地について、性質の異なる 3 つの情報を突き合わせ、`Location Check` として表示します（表示のみで、配点は仮想ロケーション判定を除き行いません）。
+
+| 情報 | 取得元 | 性質 |
+| :--- | :--- | :--- |
+| 登録国 | RDAP の `country` | レジストリへの登録情報。本社所在国が登録されている場合がある |
+| 申告所在地（Geofeed） | RDAP が示す Geofeed（RFC 8805 / RFC 9632）の CSV | IP の運営者が自己申告する利用地。**検証された情報ではない** |
+| 遅延 | `ping` の応答時間 | 物理的な距離の目安。ICMP を遮断している IP では取得できない |
+
+Geofeed の URL は、RDAP の `links`（`rel: geofeed`）、または備考欄の `Geofeed https://...` 形式から取得します。CSV のうち、対象 IP を含む最も細かいプレフィックスの行を採用します。
+
+| 結果 | 条件 |
+| :--- | :--- |
+| `DECLARATIONS DIFFER` | 登録国と申告所在地の国が異なる |
+| `MISMATCH` | JP と登録・申告されているのに、遅延が 90ms 以上 |
+| `CONSISTENT` | JP と登録・申告されており、遅延が 90ms 未満 |
+| `NOT VERIFIED` | Ping の応答がなく、遅延で確認できない |
+| `NOT EVALUATED` | JP 以外の登録・申告（遅延の閾値は JP 用のみ） |
+
+> Geofeed の URL は IP の登録者が自由に記載できる値のため、`https://` の URL のみを受け付け、取得サイズ（50MB）と時間（20 秒）に上限を設けています。取得した CSV は照合後に削除します。
+
 ### 判定不能の扱い
 外部サービスの障害、DNS 問い合わせの失敗、必要なコマンドの不在などでチェックを完了できなかった場合、該当項目は「Clean」や「No」ではなく **「Unknown」** と表示し、加点しません。  
 このとき Report Summary の `Confidence` 行が `PARTIAL` となり、完了できなかったチェックが列挙されます。Tor または DNSBL を確認できなかった場合、脅威の評判は `UNKNOWN` となります。**表示された調査優先度より実際の優先度が高い可能性がある** ことに注意してください。
 
-対象となるチェック: Tor 出口ノード、DNSBL（Spamhaus ZEN）、ASN（Team Cymru）、逆引き（PTR）、FCrDNS
+対象となるチェック: Tor 出口ノード、DNSBL（Spamhaus ZEN）、ASN（Team Cymru）、逆引き（PTR）、FCrDNS、Geofeed（URL が公開されているが取得できなかった場合）
 
 ## 出力
 ### 出力内容
 | 項目 | 出力内容 |
 | :--- | :--- |
 | [1] IP information | 対象IP、実行日時、ツールバージョン、使用DNSリゾルバ、RDAP取得ステータスと取得元URL（リダイレクト後に実際に回答したRIR） |
-| [2] Network Information  | ネットワーク名・ハンドル、国、割当種別、割当範囲・CIDR、登録日・最終更新日（経過日数）、管轄RIR、管理者住所、備考、逆引き（PTR）と FCrDNS 検証結果、Ping レイテンシ、Tor 出口ノード判定、DNSBL 判定（リスト種別）、ASN / AS 名 / BGP プレフィックス / ASN 登録国 / プレフィックス割当日、Abuse 連絡先、関与組織・担当者ドメイン一覧 |
+| [2] Network Information  | ネットワーク名・ハンドル、国、割当種別、割当範囲・CIDR、登録日・最終更新日（経過日数）、管轄RIR、管理者住所、備考、逆引き（PTR）と FCrDNS 検証結果、Ping レイテンシ、Geofeed の申告所在地、所在地の整合性チェック、Tor 出口ノード判定、DNSBL 判定（リスト種別）、ASN / AS 名 / BGP プレフィックス / ASN 登録国 / プレフィックス割当日、Abuse 連絡先、関与組織・担当者ドメイン一覧 |
 | [3] Analysis | [3-1] 回線種別（インフラ属性）の評価項目の合致状況と配点根拠、[3-2] 脅威シグナルの検出状況と根拠 |
 | [4] Report Summary | 調査優先度、回線種別の分類、インフラスコア、脅威の評判、判定の信頼度（Confidence）、注意書き（該当時のみ） |
-| [5] Data Sources | 各チェックの取得元、RDAP 生データの保存先 |
+| [5] Data Sources | 各チェックの取得元（Geofeed の URL を含む）、RDAP 生データの保存先 |
 
 ### JSON 出力（`--json`）
 主なキーは以下のとおりです。
@@ -130,10 +151,11 @@
 | `asn` | ASN、AS 名、BGP プレフィックス、ASN 登録国、プレフィックス割当日 |
 | `dns` | PTR、FCrDNS の結果（`fcrdns_verified` は真偽値） |
 | `ping_ms` / `tor_exit_node` / `dnsbl` | レイテンシ（取得できない場合は `null`）、Tor 判定、DNSBL 判定 |
+| `location` | `registered_country`（RDAP の登録国）、`geofeed`（`status`、`prefix`、`country`、`region`、`city`）、`check`（所在地の整合性チェックの結果） |
 | `abuse_contacts` / `entities` / `emails` | Abuse 連絡先、関与組織名、関与メールアドレス |
 | `indicators` | 合致した評価項目の配列（`type`: `risk` / `safe` / `threat` / `info`、`points`、`name`、`details`）。`threat` の `points` は常に 0 |
 | `summary` | `priority`（`HIGH` / `MEDIUM` / `LOW`）、`result`、`infrastructure`（`class`、`score`）、`threat`（`level`: `DETECTED` / `NONE_FOUND` / `UNKNOWN`、`signals`）、`note`（該当しない場合は `null`）、`confidence`（`FULL` / `PARTIAL`）、`unavailable_checks` |
-| `sources` | RDAP 取得元URL、各データソース、DNS リゾルバ、RDAP 生データの保存先 |
+| `sources` | RDAP 取得元URL、各データソース、Geofeed の URL、DNS リゾルバ、RDAP 生データの保存先 |
 
 RDAP の取得に失敗した場合は、`error` キーを含む JSON を出力して終了コード 1 で終了します。
 
@@ -156,6 +178,8 @@ RDAP の取得に失敗した場合は、`error` キーを含む JSON を出力�
 }
 ```
 
+> バージョン 1.2.0 で `summary` の構造を変更しました（`score` → `infrastructure.score`、`priority` / `threat` / `note` を追加）。
+
 ### 証跡
 スクリプト実行時、APNIC / RIPE 等から返却された生のRDAPレスポンスが以下のパスに保存されます。  
 保存先パス: `/tmp/rdap_<IPアドレス>.json`
@@ -167,7 +191,7 @@ RDAP の取得に失敗した場合は、`error` キーを含む JSON を出力�
 
 ### 日本語
 1. **診断結果の性質と限界**  
-   本スクリプトが出力する調査優先度、回線種別の分類、インフラスコアおよび脅威の評判は、公的レジストリ（APNIC / JPNIC / RIPE / ARIN 等）が公開するネットワーク登録情報、DNS 逆引きおよび正引き、ICMP 応答、外部データソース（Tor Project 出口ノード一覧、Spamhaus ZEN、Team Cymru IP to ASN Mapping）に基づく**「インフラ属性上の推定情報」**です。対象IPによる通信内容そのものの無害性、正規性、または安全性を100%保証するものではありません。
+   本スクリプトが出力する調査優先度、回線種別の分類、インフラスコアおよび脅威の評判は、公的レジストリ（APNIC / JPNIC / RIPE / ARIN 等）が公開するネットワーク登録情報、DNS 逆引きおよび正引き、ICMP 応答、外部データソース（Tor Project 出口ノード一覧、Spamhaus ZEN、Team Cymru IP to ASN Mapping、IP 運営者が自己申告する Geofeed）に基づく**「インフラ属性上の推定情報」**です。対象IPによる通信内容そのものの無害性、正規性、または安全性を100%保証するものではありません。
 2. **アカウント侵害・マルウェア感染のリスク**  
    調査優先度が「LOW」、または脅威の評判が「NONE FOUND」と判定された場合であっても、正規エンドユーザーの端末がマルウェア（ボットネット等）に感染している可能性や、盗まれた正規アカウントによる不正アクセスの可能性を排除するものではありません。最終的な脅威判断は、必ずアプリケーションログや認証ログの振る舞い（ステータスコード、リクエストパラメータ等）と併せて実施してください。
 3. **運用・遮断判断に伴う責任**  
@@ -179,7 +203,7 @@ RDAP の取得に失敗した場合は、`error` キーを含む JSON を出力�
 
 ### English
 1. **Nature and Limitations of Assessment**  
-   The investigation priority, infrastructure classification, infrastructure score, and threat reputation provided by this script are heuristic evaluations based on publicly available registry data (APNIC, JPNIC, RIPE, ARIN, etc.), reverse and forward DNS (PTR / FCrDNS), ICMP latency, and external data sources (Tor Project exit list, Spamhaus ZEN, Team Cymru IP to ASN Mapping). This tool does not guarantee the safety, legitimacy, or harmlessness of any underlying HTTP request or communication payload.
+   The investigation priority, infrastructure classification, infrastructure score, and threat reputation provided by this script are heuristic evaluations based on publicly available registry data (APNIC, JPNIC, RIPE, ARIN, etc.), reverse and forward DNS (PTR / FCrDNS), ICMP latency, and external data sources (Tor Project exit list, Spamhaus ZEN, Team Cymru IP to ASN Mapping, and operator-declared geofeeds). This tool does not guarantee the safety, legitimacy, or harmlessness of any underlying HTTP request or communication payload.
 2. **Risk of Endpoint Compromise**  
    A "LOW" priority or a "NONE FOUND" threat reputation indicates only that no infrastructure-level anomalies or listings were found in the checked sources; it does not preclude scenarios involving malware-infected legitimate hosts (e.g., botnets), credential stuffing, or authorized account takeovers. Operational decisions must cross-reference application-layer behavior and authentication logs.
 3. **Limitation of Liability**  
