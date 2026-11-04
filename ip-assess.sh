@@ -5,7 +5,7 @@
 # ============================================================
 
 SCRIPT_NAME="ip-assess"
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 
 usage() {
     echo "Usage: $0 [--json] <IPv4_ADDRESS>"
@@ -723,17 +723,38 @@ if echo "$PTR_LOWER" | grep -qE "$CRAWLER_REGEX"; then
 fi
 
 # A. 国内一般通信キャリア・ISP・モバイル
+#   判定根拠（上から順に採用）
+#     1. FCrDNS 検証済みの PTR が国内 ISP のドメイン
+#     2. 経路を広告している ASN が国内の一般向け ISP・モバイルキャリア
+#     3. ASN を取得できなかった場合のみ、ネットワーク名・登録組織名
+#   ※備考欄（remarks）は登録者が自由に書けるため使わない
+#   ※AS2914（NTT の国際基幹網）や IIJ（AS2497、法人・データセンター事業を含む）は一般向けとみなさない
+CONSUMER_ISP_ASNS=" 4713 2516 17676 9605 138384 2527 2518 4685 17511 18126 9824 "
 ISP_REGEX="(ocn\.ne\.jp|kddi\.ne\.jp|bbtec\.net|mesh\.ad\.jp|plala\.or\.jp|so-net\.ne\.jp|eonet\.ne\.jp|flets|spmode\.ne\.jp|au-net\.ne\.jp|rmobile\.jp|panda-world|nuro\.jp|biglobe\.ne\.jp|iij\.ad\.jp|iijmio|zaq\.ne\.jp|asahi-net|commufa\.jp|bbiq\.jp|megaegg\.ne\.jp|pikara\.ne\.jp|dion\.ne\.jp|vectant|ucom|open-cgn)"
-if echo "$PTR_TRUSTED_LOWER" | grep -qEi "$ISP_REGEX" || echo "$METADATA_LOWER" | grep -qEi "(ntt communications|kddi corporation|softbank corp|rakuten mobile|internet initiative japan|biglobe)"; then
+ISP_ORG_REGEX="(ntt communications|kddi corporation|softbank corp|rakuten mobile|internet initiative japan|biglobe)"
+ISP_ORG_LOWER=$(echo "${NET_NAME} ${ALL_FNS}" | tr '[:upper:]' '[:lower:]')
+ISP_NAME_IN_META=$(echo "$METADATA_LOWER" | grep -oEi "$ISP_ORG_REGEX" | head -n1)
+
+ISP_EVIDENCE=""
+if echo "$PTR_TRUSTED_LOWER" | grep -qEi "$ISP_REGEX"; then
+    ISP_EVIDENCE="FCrDNS-verified PTR='${PTR}'"
+elif [ -n "$ASN_NUM" ] && [[ "$CONSUMER_ISP_ASNS" == *" ${ASN_NUM} "* ]]; then
+    ISP_EVIDENCE="Consumer ISP ASN matched AS${ASN_NUM} (${AS_NAME})"
+elif [ -z "$ASN_NUM" ] && echo "$ISP_ORG_LOWER" | grep -qEi "$ISP_ORG_REGEX"; then
+    ISP_EVIDENCE="Organization name only (ASN unavailable): $(echo "$ISP_ORG_LOWER" | grep -oEi "$ISP_ORG_REGEX" | head -n1)"
+fi
+
+if [ -n "$ISP_EVIDENCE" ]; then
     indicator "[o] Safe Indicator [-5 pts]: Domestic Consumer ISP / Mobile Carrier detected"
-    if echo "$PTR_TRUSTED_LOWER" | grep -qEi "$ISP_REGEX"; then
-        detail "- Evidence : FCrDNS-verified PTR='${PTR}'"
-    else
-        detail "- Evidence : Domestic ISP found in Organization Metadata"
-    fi
+    detail "- Evidence : ${ISP_EVIDENCE}"
     detail "- Reason : This is a regular access line used directly by general users in their daily lives."
     INFRA_SCORE=$((INFRA_SCORE - 5))
     ISP_HIT=1
+elif [ -n "$ISP_NAME_IN_META" ] && [ -n "$ASN_NUM" ]; then
+    # ISP 名は登録情報に出てくるが、経路は一般向け ISP のものではない
+    indicator "[i] Info: Domestic ISP name found in registration data, but not treated as a consumer line"
+    detail "- Evidence : '${ISP_NAME_IN_META}' in registration data / routed by AS${ASN_NUM} (${AS_NAME})"
+    detail "- Reason : The routing ASN is not a known consumer ISP. Typical of transit, business or resold hosting ranges."
 fi
 
 # B. 企業向け SASE / 業務 VPN
