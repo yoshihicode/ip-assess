@@ -60,6 +60,7 @@
 | **安全** | **Verified Search Engine Crawler** | **-5** | FCrDNS 検証済みの PTR が Google / Bing / Apple / Yandex / Baidu の公式クローラードメインに一致。遮断すると検索インデックス（SEO）に影響するため。 |
 | **警戒** | **Datacenter / Hosting / Cloud** | **+3** | AWS、Azure、さくら、ConoHa、海外ホスティング（Zare/Hydra等）。既知のホスティング事業者 ASN、または登録情報・PTR のキーワードで判定。一般端末ではなくサーバー設備帯域であり、ボットや中継プロキシの温床となるため。 |
 | **警戒** | **IP Sub-leasing / Domain Discrepancy** | **+3** | レジストリ契約組織（LIR）と運用担当組織のドメインが不一致。海外プロキシ業者への又貸し・再販が行われており、真の発信元追跡を困難にするため。 |
+| **警戒** | **Anonymizing VPN Service** | **+3** | Shodan InternetDB のタグに `vpn` が付与されている。VPN サービスの接続点であり、通信の真の発信元が隠されるため。 |
 | **警戒** | **Virtual Office / PO Box Address** | **+2** | 組織・グループ等の登録住所に私書箱（Suite, Ste, PO Box, P.O. Box 等）表記。実体オフィスを持たないペーパーカンパニーや不審事業者が身元隠蔽に多用するため。※個人（`individual`）の連絡先住所のみが該当した場合は、配点なしの情報（`[i] Info`）として表示 |
 | **警戒** | **Suspected Virtual Location** | **+2** | RDAP の登録国、または Geofeed の申告所在地が JP であるにもかかわらず Ping 応答が 90ms 以上。光速度の物理限界から、実機が欧米等の海外に存在し日本拠点を偽装しているため。※日本国内から実行する前提 |
 | **警戒** | **Provider Aggregatable (PA) Block** | **+1** | エンドユーザーへ小分けして再販・貸出を行うための IP アドレス枠であるため。 |
@@ -110,6 +111,9 @@ RDAP の各エンティティ（登録組織、Abuse 窓口、管理・技術担
 | **Confirmed Tor Exit Node** | Tor Project 公式のアクティブ出口ノード一覧に合致。オニオンルーティングによる匿名化通信であり、真の発信元を追跡できないため。 |
 | **Public Threat Blacklist (DNSBL)** | Spamhaus ZEN の SBL / CSS / XBL / DROP に登録済み。既知のスパム送信元、マルウェア感染端末（ボットネット）、不正プロキシ、犯罪者管理下のネットワーク等であるため。※PBL のみの登録は一般回線の動的 IP を示すため、情報表示のみで脅威とはみなさない |
 | **Spoofed Search Engine Crawler PTR** | PTR が検索エンジンのクローラードメインを名乗っているが、正引きで元の IP に戻らない。正規クローラーへのなりすましであり、ボット対策の回避を狙ったスクレイパーの典型であるため。 |
+| **Aggregated Blocklists (IPsum)** | 30 以上の公開ブラックリストを集約した IPsum で、**3 件以上** のリストに掲載。複数の独立したリストに載っており、単一リストの誤検知の可能性が低いため。※1〜2 件の掲載は誤検知も多いため、情報表示のみ。研究目的のスキャナー（Shodan・Censys 等）も含まれる点に注意 |
+| **Compromised Host (Shodan)** | Shodan InternetDB のタグに `compromised`・`malware`・`c2`・`doublepulsar`・`botnet` のいずれかが付与されている。乗っ取られた機器であり、通信が第三者（ボットネット）に操作されている可能性があるため。 |
+| **Exposed Proxy Service (Shodan)** | Shodan InternetDB で、プロキシ用のポート（1080・3128・8118・9050）が開いている、またはタグに `proxy` が付与されている。他者の通信を中継する機器であり、一般回線上であれば住宅用プロキシの中継点や乗っ取られた機器の可能性が高いため。回線種別の減点で打ち消されないよう、脅威シグナルとして扱う |
 
 判定結果は次の 3 種類です。
 
@@ -117,7 +121,7 @@ RDAP の各エンティティ（登録組織、Abuse 窓口、管理・技術担
 | :--- | :--- |
 | `DETECTED` | 脅威シグナルを 1 つ以上検出 |
 | `NONE FOUND` | 確認したデータソースの範囲では検出なし（安全の証明ではない） |
-| `UNKNOWN` | Tor または DNSBL のチェックを完了できなかった |
+| `UNKNOWN` | Tor、DNSBL、IPsum のいずれかのチェックを完了できなかった |
 
 ### 調査優先度
 
@@ -159,7 +163,9 @@ Geofeed の URL は、RDAP の `links`（`rel: geofeed`）、または備考欄�
 外部サービスの障害、DNS 問い合わせの失敗、必要なコマンドの不在などでチェックを完了できなかった場合、該当項目は「Clean」や「No」ではなく **「Unknown」** と表示し、加点しません。  
 このときレポート先頭のサマリーの `Confidence` 行が `PARTIAL` となり、完了できなかったチェックが列挙されます。Tor または DNSBL を確認できなかった場合、脅威の評判は `UNKNOWN` となります。**表示された調査優先度より実際の優先度が高い可能性がある** ことに注意してください。
 
-対象となるチェック: Tor 出口ノード、DNSBL（Spamhaus ZEN）、ASN（Team Cymru）、逆引き（PTR）、FCrDNS、Geofeed（URL が公開されているが取得できなかった場合）
+対象となるチェック: Tor 出口ノード、DNSBL（Spamhaus ZEN）、IPsum（キャッシュもない場合）、Shodan InternetDB、ASN（Team Cymru）、逆引き（PTR）、FCrDNS、Geofeed（URL が公開されているが取得できなかった場合）
+
+Shodan InternetDB が「データなし」（HTTP 404）を返した場合は、判定不能ではなく「Shodan のスキャンで公開サービスが見つかっていない」という結果として扱います。
 
 #### 逆引きの SERVFAIL について
 逆引き・正引きの問い合わせで SERVFAIL が返った場合は、実行環境側の問題か、相手側の問題かを切り分けます。SERVFAIL を受け取ると、ルートサーバー（`a.root-servers.net`）の正引きでリゾルバの健全性を 1 回だけ確認します。
@@ -178,12 +184,13 @@ FCrDNS の正引きが相手側で SERVFAIL となった場合は、「Not verif
 
 | セクション | 内容 |
 | :--- | :--- |
-| サマリー | 対象IP、実行日時、ツールバージョン、調査優先度、回線種別の分類とインフラスコア、脅威の評判、判定の信頼度（Confidence）、注意書き（該当時のみ） |
+| サマリー | 対象IP、実行日時、調査優先度、回線種別の分類とインフラスコア、脅威の評判、判定の信頼度（Confidence）、注意書き（該当時のみ） |
 | NETWORK | ネットワーク名・ハンドル、割当範囲・CIDR、割当種別、登録日・最終更新日（経過日数）、管轄RIR、備考、ASN / AS 名 / BGP プレフィックス / ASN 登録国 / プレフィックス割当日、逆引き（PTR）、FCrDNS 検証結果 |
 | LOCATION | 登録国、Geofeed の申告所在地、代表の住所（Holder Address）とその国、Ping レイテンシ、所在地の整合性チェック |
 | CONTACTS | エンティティごとの登録住所（種別・名前・役割・ハンドル付き）、Abuse 連絡先、エンティティ名、関与メールアドレスとドメイン |
+| EXPOSURE | Shodan InternetDB の結果（開いているポート、タグ、既知の脆弱性、CPE、ホスト名）。データは週 1 回更新 |
 | INFRASTRUCTURE ATTRIBUTES | 回線種別の全評価項目と、その配点・根拠。**該当しなかった項目や判定不能の項目も含めて** 一覧表示 |
-| THREAT REPUTATION | 脅威の評判の全評価項目（Spamhaus ZEN、Tor 出口ノード、偽装クローラー）と、その結果 |
+| THREAT REPUTATION | 脅威の評判の全評価項目（Spamhaus ZEN、IPsum、Shodan の乗っ取り・公開プロキシ、Tor 出口ノード、偽装クローラー）と、その結果 |
 | DETAILS | 各評価項目の判定根拠（Evidence / Reason）。`--verbose` 指定時のみ |
 | DATA SOURCES | 各チェックの取得元（RDAP の取得元URL、Geofeed の URL を含む）、DNS リゾルバ、RDAP 生データの保存先 |
 
@@ -216,11 +223,13 @@ RDAP の取得に失敗した場合は、エラーメッセージを標準エラ
 | `asn` | ASN、AS 名、BGP プレフィックス、ASN 登録国、プレフィックス割当日 |
 | `dns` | PTR、`ptr_status`（`found`: 取得成功 / `none`: 登録なし / `broken`: 相手側で SERVFAIL / `failed`: 実行環境側の失敗）、FCrDNS の結果（`fcrdns_verified` は真偽値） |
 | `ping_ms` / `tor_exit_node` / `dnsbl` | レイテンシ（取得できない場合は `null`）、Tor 判定、DNSBL 判定 |
+| `ipsum` | `status`（掲載状況とフィードの更新日時）、`count`（掲載リスト数） |
+| `exposure` | Shodan InternetDB の `status`、`ports`（数値の配列）、`tags`、`vulns`、`cpes`、`hostnames` |
 | `location` | `registered_country`（RDAP の登録国）、`geofeed`（`status`、`prefix`、`country`、`region`、`city`）、`check`（所在地の整合性チェックの結果） |
 | `abuse_contacts` / `entities` / `emails` | Abuse 連絡先、関与組織名、関与メールアドレス |
 | `indicators` | 合致した評価項目の配列（`type`: `risk` / `safe` / `threat` / `info`、`points`、`name`、`details`）。`threat` の `points` は常に 0 |
 | `summary` | `priority`（`HIGH` / `MEDIUM` / `LOW`）、`result`、`infrastructure`（`class`、`score`）、`threat`（`level`: `DETECTED` / `NONE_FOUND` / `UNKNOWN`、`signals`）、`note`（該当しない場合は `null`）、`confidence`（`FULL` / `PARTIAL`）、`unavailable_checks` |
-| `sources` | RDAP 取得元URL、各データソース、Geofeed の URL、DNS リゾルバ、RDAP 生データの保存先 |
+| `sources` | RDAP 取得元URL、各データソース（Shodan InternetDB、IPsum を含む）、Geofeed の URL、DNS リゾルバ、RDAP 生データの保存先 |
 
 RDAP の取得に失敗した場合は、`error` キーを含む JSON を出力して終了コード 1 で終了します。
 
@@ -252,26 +261,42 @@ RDAP の取得に失敗した場合は、`error` キーを含む JSON を出力�
 診断結果を証跡として残す場合は、`--json` の出力をファイルに保存してください。実行日時・ツールバージョン・各データの取得元・判定根拠がすべて含まれます。  
 ※ `/tmp` 配下の RDAP 生データは OS により自動削除される場合があるため、必要に応じて JSON とあわせて別の場所へ保管してください。
 
+## 外部データソースと利用条件
+本スクリプトは以下の外部データソースを利用します。**各データソースの利用条件は利用者自身で確認し、遵守してください。** 条件は変更される場合があります。
+
+| データソース | 用途 | 利用条件・注意点 |
+| :--- | :--- | :--- |
+| RDAP（APNIC / RIPE / ARIN 等） | 登録情報 | 各 RIR の利用規約に従う |
+| Team Cymru IP to ASN Mapping | ASN・BGP プレフィックス | DNS 経由で問い合わせ |
+| Spamhaus ZEN | DNSBL | 公開ミラーの無料利用は非商用・小規模の利用に限られ、公開 DNS リゾルバ経由の問い合わせは拒否される。業務での利用は条件を確認すること |
+| Tor Project 出口ノード一覧 | Tor 判定 | 公開一覧 |
+| Shodan InternetDB | 公開サービス（ポート・タグ・脆弱性） | APIキー不要。非商用の利用は無料で、企業内での利用は可能だが、料金を取る商用製品に組み込む場合は別途ライセンスが必要 |
+| IPsum | 集約型の脅威リスト | Unlicense（パブリックドメイン相当）。毎日更新 |
+| Geofeed | 申告所在地 | IP 運営者が公開するファイル |
+
+### IPsum のキャッシュ
+IPsum のファイル（約 2MB）は `${XDG_CACHE_HOME:-~/.cache}/ip-assess/ipsum.txt` に保存し、**12 時間以内であれば再利用** します。取得に失敗した場合は、古いキャッシュがあれば「STALE」と明記して使用し、なければ判定不能とします。
+
 ## 免責事項 / Disclaimer
 
 ### 日本語
 1. **診断結果の性質と限界**  
-   本スクリプトが出力する調査優先度、回線種別の分類、インフラスコアおよび脅威の評判は、公的レジストリ（APNIC / JPNIC / RIPE / ARIN 等）が公開するネットワーク登録情報、DNS 逆引きおよび正引き、ICMP 応答、外部データソース（Tor Project 出口ノード一覧、Spamhaus ZEN、Team Cymru IP to ASN Mapping、IP 運営者が自己申告する Geofeed）に基づく**「インフラ属性上の推定情報」**です。対象IPによる通信内容そのものの無害性、正規性、または安全性を100%保証するものではありません。
+   本スクリプトが出力する調査優先度、回線種別の分類、インフラスコアおよび脅威の評判は、公的レジストリ（APNIC / JPNIC / RIPE / ARIN 等）が公開するネットワーク登録情報、DNS 逆引きおよび正引き、ICMP 応答、外部データソース（Tor Project 出口ノード一覧、Spamhaus ZEN、IPsum、Shodan InternetDB、Team Cymru IP to ASN Mapping、IP 運営者が自己申告する Geofeed）に基づく**「インフラ属性上の推定情報」**です。対象IPによる通信内容そのものの無害性、正規性、または安全性を100%保証するものではありません。
 2. **アカウント侵害・マルウェア感染のリスク**  
    調査優先度が「LOW」、または脅威の評判が「NONE FOUND」と判定された場合であっても、正規エンドユーザーの端末がマルウェア（ボットネット等）に感染している可能性や、盗まれた正規アカウントによる不正アクセスの可能性を排除するものではありません。最終的な脅威判断は、必ずアプリケーションログや認証ログの振る舞い（ステータスコード、リクエストパラメータ等）と併せて実施してください。
 3. **運用・遮断判断に伴う責任**  
-   本スクリプトの診断結果に基づいて実施されたアクセス遮断（WAF やファイアウォールへの拒否登録）、通信制限、サービス停止等に起因する直接的・間接的な損害（業務停止、逸失利益、正規ユーザーからのクレーム等）について、本スクリプトの作成者および提供者は一切の責任を負いません。通信の遮断にあたっては、システム管理者の責任において十分なログ精査および影響範囲の確認を行ってください。
+   本スクリプトの診断結果に基づいて実施されたアクセス遮断（WAF やファイアウォールへの拒否登録）、通信制限、サービス停止等に起因する直接的・間接的な損害（業務停止、逸失利益、正規ユーザーからのクレーム等）について、本スクリプトの作成者は一切の責任を負いません。通信の遮断にあたっては、システム管理者の責任において十分なログ精査および影響範囲の確認を行ってください。
 4. **外部サービスの仕様変更および制限**  
-   RDAP / Whois、Tor Project、Spamhaus、Team Cymru 等の提供元の仕様変更、一時的な障害、問い合わせ過多によるレートリミット（アクセス制限）、またはお客様環境のファイアウォール設定（ICMP / HTTP 制限）等により、正確な情報が取得できない場合があります。
+   RDAP / Whois、Tor Project、Spamhaus、IPsum、Shodan、Team Cymru 等の提供元の仕様変更、一時的な障害、問い合わせ過多によるレートリミット（アクセス制限）、または実行環境のファイアウォール設定（ICMP / HTTP / DNS の制限）等により、正確な情報が取得できない場合があります。
 
 ---
 
 ### English
 1. **Nature and Limitations of Assessment**  
-   The investigation priority, infrastructure classification, infrastructure score, and threat reputation provided by this script are heuristic evaluations based on publicly available registry data (APNIC, JPNIC, RIPE, ARIN, etc.), reverse and forward DNS (PTR / FCrDNS), ICMP latency, and external data sources (Tor Project exit list, Spamhaus ZEN, Team Cymru IP to ASN Mapping, and operator-declared geofeeds). This tool does not guarantee the safety, legitimacy, or harmlessness of any underlying HTTP request or communication payload.
+   The investigation priority, infrastructure classification, infrastructure score, and threat reputation provided by this script are heuristic evaluations based on publicly available registry data (APNIC, JPNIC, RIPE, ARIN, etc.), reverse and forward DNS (PTR / FCrDNS), ICMP latency, and external data sources (Tor Project exit list, Spamhaus ZEN, IPsum, Shodan InternetDB, Team Cymru IP to ASN Mapping, and operator-declared geofeeds). This tool does not guarantee the safety, legitimacy, or harmlessness of any underlying HTTP request or communication payload.
 2. **Risk of Endpoint Compromise**  
    A "LOW" priority or a "NONE FOUND" threat reputation indicates only that no infrastructure-level anomalies or listings were found in the checked sources; it does not preclude scenarios involving malware-infected legitimate hosts (e.g., botnets), credential stuffing, or authorized account takeovers. Operational decisions must cross-reference application-layer behavior and authentication logs.
 3. **Limitation of Liability**  
-   The authors and distributors of this script accept no liability for any direct, indirect, incidental, or consequential damages (including, but not limited to, business interruption, loss of profits, or service disruptions) resulting from operational actions, firewall rules, or IP-blocking measures implemented based on this tool's output. Administrators are solely responsible for verifying logs prior to enforcing containment actions.
+   The author of this script accepts no liability for any direct, indirect, incidental, or consequential damages (including, but not limited to, business interruption, loss of profits, or service disruptions) resulting from operational actions, firewall rules, or IP-blocking measures implemented based on this tool's output. Administrators are solely responsible for verifying logs prior to enforcing containment actions.
 4. **External Service Availability & Rate Limits**  
-   Lookup accuracy depends on the availability of external services (RIRs, Tor Project, Spamhaus, Team Cymru) and local network permissions. Spamhaus refuses queries via public DNS resolvers. Query limitations, rate limits, or outbound network filtering may impact the completeness of the retrieved intelligence.
+   Lookup accuracy depends on the availability of external services (RIRs, Tor Project, Spamhaus, IPsum, Shodan, Team Cymru) and local network permissions. Shodan InternetDB data is updated weekly and may not reflect the current state. Spamhaus refuses queries via public DNS resolvers. Query limitations, rate limits, or outbound network filtering may impact the completeness of the retrieved intelligence.

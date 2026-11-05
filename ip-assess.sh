@@ -5,7 +5,7 @@
 # ============================================================
 
 SCRIPT_NAME="ip-assess"
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.6.0"
 
 usage() {
     echo "Usage: $0 [--json] [--plain] [--verbose] <IPv4_ADDRESS>"
@@ -696,6 +696,85 @@ DOMAIN_COUNT=$(echo "$DOMAINS" | grep -c .)
 ALL_FNS=$(grep -oEi '"fn"\s*,\s*\{[^}]*\}\s*,\s*"text"\s*,\s*"[^"]+"' "${TMP_FILE}" | sed -E 's/.*"([^"]+)"$/\1/' | sort -u)
 
 echo ""
+# ------------------------------------------------------------
+# Shodan InternetDB（開いているポート・タグ・既知の脆弱性。APIキー不要、週1回更新）
+#   200: データあり / 404: データなし（スキャンで何も見つかっていない） / その他: 取得失敗
+#   ※非商用利用は無料。商用製品への組み込みには別途ライセンスが必要
+# ------------------------------------------------------------
+IDB_STATUS="Unknown"
+IDB_PORTS=""; IDB_TAGS=""; IDB_VULNS=""; IDB_CPES=""; IDB_HOSTNAMES=""
+IDB_TMP=$(mktemp 2>/dev/null || echo "/tmp/internetdb_${IP}_$$.json")
+IDB_HTTP=$(curl -s --connect-timeout 5 --max-time 15 -o "$IDB_TMP" -w "%{http_code}" "https://internetdb.shodan.io/${IP}" 2>/dev/null)
+case "$IDB_HTTP" in
+    200)
+        IDB_FLAT=$(json_flatten "$IDB_TMP")
+        idb_list() { echo "$IDB_FLAT" | awk -F'\t' -v k="$1" 'index($1, "." k "[") == 1 {print $2}'; }
+        IDB_PORTS=$(idb_list ports | sort -n | tr '\n' ' ' | sed 's/ $//')
+        IDB_TAGS=$(idb_list tags | tr '\n' ' ' | sed 's/ $//')
+        IDB_VULNS=$(idb_list vulns | sort | tr '\n' ' ' | sed 's/ $//')
+        IDB_CPES=$(idb_list cpes | tr '\n' ' ' | sed 's/ $//')
+        IDB_HOSTNAMES=$(idb_list hostnames | tr '\n' ' ' | sed 's/ $//')
+        IDB_STATUS="Found" ;;
+    404)
+        IDB_STATUS="No data (nothing observed by Shodan scans)" ;;
+    *)
+        IDB_STATUS="Unknown (failed to fetch, HTTP ${IDB_HTTP:-none})"
+        UNAVAILABLE_CHECKS+=("Shodan InternetDB") ;;
+esac
+rm -f "$IDB_TMP"
+
+# プロキシ用のポート（SOCKS / Squid / Privoxy / Tor SOCKS）
+IDB_PROXY_PORTS=$(for p in $IDB_PORTS; do case "$p" in 1080|3128|8118|9050) printf '%s ' "$p" ;; esac; done | sed 's/ $//')
+IDB_TAGS_LOWER=$(echo "$IDB_TAGS" | tr '[:upper:]' '[:lower:]')
+# 乗っ取り・マルウェアを示すタグ
+IDB_COMPROMISED_TAGS=$(for t in $IDB_TAGS_LOWER; do case "$t" in compromised|malware|c2|doublepulsar|botnet) printf '%s ' "$t" ;; esac; done | sed 's/ $//')
+IDB_HAS_PROXY_TAG=0; IDB_HAS_VPN_TAG=0
+for t in $IDB_TAGS_LOWER; do
+    [ "$t" = "proxy" ] && IDB_HAS_PROXY_TAG=1
+    [ "$t" = "vpn" ] && IDB_HAS_VPN_TAG=1
+done
+IDB_VULN_COUNT=$(echo "$IDB_VULNS" | wc -w | tr -d ' ')
+
+# ------------------------------------------------------------
+# IPsum（30以上の公開ブラックリストの集約。毎日更新）
+#   掲載リスト数が 3 以上なら脅威シグナル、1〜2 は情報表示（単独リストは誤検知も多い）
+#   取得したファイルは 12 時間キャッシュする
+# ------------------------------------------------------------
+IPSUM_URL="https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt"
+IPSUM_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ip-assess"
+IPSUM_CACHE="${IPSUM_CACHE_DIR}/ipsum.txt"
+IPSUM_STATUS="Unknown"
+IPSUM_COUNT=0
+IPSUM_SOURCE=""
+mkdir -p "$IPSUM_CACHE_DIR" 2>/dev/null
+if [ -s "$IPSUM_CACHE" ] && [ -n "$(find "$IPSUM_CACHE" -mmin -720 2>/dev/null)" ]; then
+    IPSUM_SOURCE="cache"
+else
+    IPSUM_NEW="${IPSUM_CACHE}.$$"
+    if curl -sf --compressed --connect-timeout 5 --max-time 30 -o "$IPSUM_NEW" "$IPSUM_URL" 2>/dev/null \
+            && grep -q '^# IPsum' "$IPSUM_NEW"; then
+        mv -f "$IPSUM_NEW" "$IPSUM_CACHE"
+        IPSUM_SOURCE="fresh"
+    else
+        rm -f "$IPSUM_NEW"
+        [ -s "$IPSUM_CACHE" ] && IPSUM_SOURCE="stale"
+    fi
+fi
+if [ -n "$IPSUM_SOURCE" ]; then
+    IPSUM_UPDATED=$(awk '/^# Last update:/ {sub(/^# Last update: */, ""); print; exit}' "$IPSUM_CACHE")
+    IPSUM_COUNT=$(awk -F'\t' -v ip="$IP" '$1 == ip {print $2; exit}' "$IPSUM_CACHE")
+    [ -z "$IPSUM_COUNT" ] && IPSUM_COUNT=0
+    if [ "$IPSUM_COUNT" -ge 1 ]; then
+        IPSUM_STATUS="Listed on ${IPSUM_COUNT} blocklist(s)"
+    else
+        IPSUM_STATUS="Not listed"
+    fi
+    IPSUM_STATUS="${IPSUM_STATUS} (feed updated: ${IPSUM_UPDATED:-unknown}$( [ "$IPSUM_SOURCE" = "stale" ] && echo ", STALE cache: latest fetch failed"))"
+else
+    IPSUM_STATUS="Unknown (failed to fetch the feed)"
+    UNAVAILABLE_CHECKS+=("IPsum")
+fi
+
 # 所在地の整合性チェック（登録国・申告所在地・遅延の突き合わせ）
 #   遅延の閾値（90ms）は日本国内から実行する前提
 DECLARED_JP=0
@@ -822,6 +901,7 @@ DC_HIT=0
 SUBLEASE_HIT=0
 VIRTUAL_HIT=0
 PA_HIT=0
+VPN_HIT=0
 NOPTR_HIT=0
 METADATA_LOWER=$(echo "${NET_NAME} ${ALL_FNS} ${REMARKS} ${DOMAINS} ${ALL_ADDRESSES_TEXT}" | tr '[:upper:]' '[:lower:]')
 PTR_LOWER=""
@@ -960,6 +1040,15 @@ if [ -n "$BOX_HITS" ]; then
     fi
 fi
 
+# 匿名化 VPN サービス (+3)（Shodan のタグ）
+if [ "$IDB_HAS_VPN_TAG" -eq 1 ]; then
+    indicator "[!] Risk Indicator [+3 pts]: Anonymizing VPN service detected (Shodan tag)"
+    detail "- Evidence : Shodan InternetDB tags: ${IDB_TAGS} / open ports: ${IDB_PORTS}"
+    detail "- Reason : A VPN service endpoint hides the real source of the traffic."
+    INFRA_SCORE=$((INFRA_SCORE + 3))
+    VPN_HIT=1
+fi
+
 # 仮想ロケーション疑い (+2)
 if [ "$PING_VAL" -ge 90 ] && [ "$DECLARED_JP" -eq 1 ]; then
     indicator "[!] Risk Indicator [+2 pts]: Virtual Location (IP Registration Location and Physical Location Mismatch) Suspected"
@@ -1021,8 +1110,35 @@ if [ "$SPOOFED_CRAWLER" -eq 1 ]; then
     THREAT_SIGNALS+=("Spoofed crawler PTR")
 fi
 
+# IPsum（3件以上のブラックリストに掲載）
+if [ "$IPSUM_COUNT" -ge 3 ]; then
+    indicator "[X] Threat Signal: Listed on ${IPSUM_COUNT} public blocklists (IPsum)"
+    detail "- Evidence : ${IPSUM_STATUS}"
+    detail "- Rationale: Appears on multiple independent blocklists; a single false positive is unlikely. Note that some lists include research scanners."
+    THREAT_SIGNALS+=("IPsum ${IPSUM_COUNT} lists")
+elif [ "$IPSUM_COUNT" -ge 1 ]; then
+    indicator "[i] Info: Listed on ${IPSUM_COUNT} public blocklist(s) (IPsum, below threshold of 3)"
+    detail "- Reason : A listing on only one or two lists is common and often a false positive."
+fi
+
+# 乗っ取られた機器・マルウェア（Shodan のタグ）
+if [ -n "$IDB_COMPROMISED_TAGS" ]; then
+    indicator "[X] Threat Signal: Compromised host / malware indicated by Shodan tags"
+    detail "- Evidence : Shodan InternetDB tags: ${IDB_COMPROMISED_TAGS}"
+    detail "- Rationale: The host shows signs of compromise; traffic from it may be controlled by a third party (botnet)."
+    THREAT_SIGNALS+=("Shodan: ${IDB_COMPROMISED_TAGS}")
+fi
+
+# 公開プロキシ（プロキシ用ポートまたは proxy タグ）
+if [ -n "$IDB_PROXY_PORTS" ] || [ "$IDB_HAS_PROXY_TAG" -eq 1 ]; then
+    indicator "[X] Threat Signal: Proxy service exposed on this host (Shodan)"
+    detail "- Evidence : $( [ -n "$IDB_PROXY_PORTS" ] && echo "proxy ports: ${IDB_PROXY_PORTS}")$( [ -n "$IDB_PROXY_PORTS" ] && [ "$IDB_HAS_PROXY_TAG" -eq 1 ] && echo " / ")$( [ "$IDB_HAS_PROXY_TAG" -eq 1 ] && echo "tag: proxy")"
+    detail "- Rationale: The host relays traffic for others. On a consumer line this suggests a residential proxy node or a compromised device."
+    THREAT_SIGNALS+=("Proxy service exposed")
+fi
+
 if [ "${#THREAT_SIGNALS[@]}" -eq 0 ]; then
-    echo "No threat signals found in the checked sources (Tor exit list, Spamhaus ZEN, crawler PTR)."
+    echo "No threat signals found in the checked sources (Tor exit list, Spamhaus ZEN, IPsum, Shodan InternetDB, crawler PTR)."
 fi
 
 # ------------------------------------------------------------
@@ -1049,7 +1165,7 @@ fi
 # ------------------------------------------------------------
 REPUTATION_INCOMPLETE=0
 for c in "${UNAVAILABLE_CHECKS[@]}"; do
-    case "$c" in "Tor Exit Node"|"DNSBL"*) REPUTATION_INCOMPLETE=1 ;; esac
+    case "$c" in "Tor Exit Node"|"DNSBL"*|"IPsum") REPUTATION_INCOMPLETE=1 ;; esac
 done
 if [ "${#THREAT_SIGNALS[@]}" -gt 0 ]; then
     THREAT_LEVEL="DETECTED"
@@ -1245,6 +1361,18 @@ render_report() {
         echo "    - None"
     fi
 
+    # ---------------- 公開サービス（Shodan InternetDB） ----------------
+    echo ""
+    echo "EXPOSURE (Shodan InternetDB, updated weekly)"
+    kv "Status"             "$IDB_STATUS"
+    if [ "$IDB_STATUS" = "Found" ]; then
+        kv "Open Ports"     "${IDB_PORTS:-none}"
+        kv "Tags"           "${IDB_TAGS:-none}"
+        kv "Known Vulns"    "$( [ "$IDB_VULN_COUNT" -gt 0 ] && echo "${IDB_VULN_COUNT}: ${IDB_VULNS}" || echo none)"
+        kv "CPEs"           "${IDB_CPES:-none}"
+        kv "Hostnames"      "${IDB_HOSTNAMES:-none}"
+    fi
+
     # ---------------- 回線種別 ----------------
     echo ""
     echo "INFRASTRUCTURE ATTRIBUTES (points)"
@@ -1277,6 +1405,10 @@ render_report() {
     if [ -n "$BOX_ORG_HITS" ]; then row "$M_RISK" "2" "PO box / virtual office" "$box_ev"
     elif [ -n "$BOX_HITS" ]; then row "$M_INFO" "" "PO box / virtual office" "individual contact only (not scored): ${box_ev}"
     else row "$M_NONE" "" "PO box / virtual office" ""; fi
+    # 匿名化 VPN
+    if [ "$VPN_HIT" -eq 1 ]; then row "$M_RISK" "3" "Anonymizing VPN service" "Shodan tags: ${IDB_TAGS}"
+    elif [ "$IDB_STATUS" != "Found" ] && [[ "$IDB_STATUS" == Unknown* ]]; then row "$M_UNK" "" "Anonymizing VPN service" "Shodan InternetDB could not be checked"
+    else row "$M_NONE" "" "Anonymizing VPN service" ""; fi
     # 仮想ロケーション
     if [ "$VIRTUAL_HIT" -eq 1 ]; then row "$M_RISK" "2" "Virtual location" "${PING_MS} ms while declared JP"
     elif [ -z "$PING_MS" ]; then row "$M_UNK" "" "Virtual location" "no latency measurement (${PING_STR})"
@@ -1297,6 +1429,17 @@ render_report() {
     elif [ "$DNSBL_INFO" = "PBL" ]; then row "$M_INFO" "" "Spamhaus ZEN" "PBL only (end-user range, not a threat)"
     elif [[ "$DNSBL_STATUS" == Unknown* ]]; then row "$M_UNK" "" "Spamhaus ZEN" "$DNSBL_STATUS"
     else row "$M_NONE" "" "Spamhaus ZEN" "not listed"; fi
+    if [ "$IPSUM_COUNT" -ge 3 ]; then row "$M_RISK" "" "IPsum aggregated blocklists" "$IPSUM_STATUS"
+    elif [ "$IPSUM_COUNT" -ge 1 ]; then row "$M_INFO" "" "IPsum aggregated blocklists" "${IPSUM_STATUS} - below threshold of 3"
+    elif [[ "$IPSUM_STATUS" == Unknown* ]]; then row "$M_UNK" "" "IPsum aggregated blocklists" "$IPSUM_STATUS"
+    else row "$M_NONE" "" "IPsum aggregated blocklists" "$IPSUM_STATUS"; fi
+    if [ -n "$IDB_COMPROMISED_TAGS" ]; then row "$M_RISK" "" "Compromised host (Shodan)" "tags: ${IDB_COMPROMISED_TAGS}"
+    elif [[ "$IDB_STATUS" == Unknown* ]]; then row "$M_UNK" "" "Compromised host (Shodan)" "Shodan InternetDB could not be checked"
+    else row "$M_NONE" "" "Compromised host (Shodan)" ""; fi
+    if [ -n "$IDB_PROXY_PORTS" ] || [ "$IDB_HAS_PROXY_TAG" -eq 1 ]; then
+        row "$M_RISK" "" "Exposed proxy service (Shodan)" "$( [ -n "$IDB_PROXY_PORTS" ] && echo "ports: ${IDB_PROXY_PORTS}")$( [ "$IDB_HAS_PROXY_TAG" -eq 1 ] && echo " tag: proxy")"
+    elif [[ "$IDB_STATUS" == Unknown* ]]; then row "$M_UNK" "" "Exposed proxy service (Shodan)" "Shodan InternetDB could not be checked"
+    else row "$M_NONE" "" "Exposed proxy service (Shodan)" ""; fi
     if [ "$TOR_HIT" -eq 1 ]; then row "$M_RISK" "" "Tor exit node" "$TOR_STATUS"
     elif [[ "$TOR_STATUS" == Unknown* ]]; then row "$M_UNK" "" "Tor exit node" "$TOR_STATUS"
     else row "$M_NONE" "" "Tor exit node" "not listed"; fi
@@ -1332,6 +1475,8 @@ render_report() {
     kv "ASN"               "Team Cymru IP to ASN Mapping"
     kv "Geofeed"           "${GEOFEED_URL:-Not published}"
     kv "DNS Resolver"      "$DNS_RESOLVER"
+    kv "Shodan InternetDB" "https://internetdb.shodan.io/${IP}"
+    kv "IPsum"             "${IPSUM_URL} (cache: ${IPSUM_CACHE})"
     kv "RDAP Raw Data"     "$TMP_FILE"
     rule
 }
@@ -1408,6 +1553,15 @@ if [ "$JSON_MODE" -eq 1 ]; then
     "check": $(jstr "$LOCATION_CHECK")
   },
   "tor_exit_node": $(jstr "$TOR_STATUS"),
+  "ipsum": {"status": $(jstr "$IPSUM_STATUS"), "count": ${IPSUM_COUNT}},
+  "exposure": {
+    "status": $(jstr "$IDB_STATUS"),
+    "ports": [$(echo "$IDB_PORTS" | tr ' ' ',')],
+    "tags": $(jarr "$(echo "$IDB_TAGS" | tr ' ' '\n')"),
+    "vulns": $(jarr "$(echo "$IDB_VULNS" | tr ' ' '\n')"),
+    "cpes": $(jarr "$(echo "$IDB_CPES" | tr ' ' '\n')"),
+    "hostnames": $(jarr "$(echo "$IDB_HOSTNAMES" | tr ' ' '\n')")
+  },
   "dnsbl": $(jstr "$DNSBL_STATUS"),
   "abuse_contacts": $(jarr "$ABUSE_EMAILS"),
   "entities": $(jarr "$ALL_FNS"),
@@ -1429,6 +1583,8 @@ if [ "$JSON_MODE" -eq 1 ]; then
     "asn": "Team Cymru IP to ASN Mapping",
     "dns_resolver": $(jstr "$DNS_RESOLVER"),
     "geofeed": $(jstr "$GEOFEED_URL"),
+    "internetdb": $(jstr "https://internetdb.shodan.io/${IP}"),
+    "ipsum": $(jstr "$IPSUM_URL"),
     "rdap_raw_file": $(jstr "$TMP_FILE")
   }
 }
