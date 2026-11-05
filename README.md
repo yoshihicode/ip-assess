@@ -57,7 +57,7 @@
 | **警戒** | **Virtual Office / PO Box Address** | **+2** | 管理者住所に私書箱（Suite, PO Box）表記。実体オフィスを持たないペーパーカンパニーや不審事業者が身元隠蔽に多用するため。 |
 | **警戒** | **Suspected Virtual Location** | **+2** | RDAP の登録国、または Geofeed の申告所在地が JP であるにもかかわらず Ping 応答が 90ms 以上。光速度の物理限界から、実機が欧米等の海外に存在し日本拠点を偽装しているため。※日本国内から実行する前提 |
 | **警戒** | **Provider Aggregatable (PA) Block** | **+1** | エンドユーザーへ小分けして再販・貸出を行うための IP アドレス枠であるため。 |
-| **警戒** | **Missing Consumer Reverse DNS (PTR)** | **+1** | 国内大手 ISP 特有のホスト名が付与されておらず、サーバー・データセンター用静的 IP の特徴を持つため。※他の警戒項目で加点済みの場合のみ |
+| **警戒** | **Missing Consumer Reverse DNS (PTR)** | **+1** | 逆引き（PTR）が登録されていない、または相手側の逆引きが正常に応答しない（SERVFAIL）。国内大手 ISP は逆引きを必ず運用しており、使える逆引きがないことはサーバー・データセンター用 IP の特徴であるため。※他の警戒項目で加点済みの場合のみ |
 
 ### 国内一般回線の判定方法
 「Domestic Consumer ISP / Mobile」（-5 点）は、以下のいずれかを根拠として、上から順に判定します。
@@ -144,6 +144,17 @@ Geofeed の URL は、RDAP の `links`（`rel: geofeed`）、または備考欄�
 
 対象となるチェック: Tor 出口ノード、DNSBL（Spamhaus ZEN）、ASN（Team Cymru）、逆引き（PTR）、FCrDNS、Geofeed（URL が公開されているが取得できなかった場合）
 
+#### 逆引きの SERVFAIL について
+逆引き・正引きの問い合わせで SERVFAIL が返った場合は、実行環境側の問題か、相手側の問題かを切り分けます。SERVFAIL を受け取ると、ルートサーバー（`a.root-servers.net`）の正引きでリゾルバの健全性を 1 回だけ確認します。
+
+| 状況 | 扱い |
+| :--- | :--- |
+| リゾルバは正常（相手側の逆引きが壊れている） | 判定不能にはせず、「使える逆引きなし」という確定した結果として扱う。ホスティング帯域でよく見られる状態 |
+| リゾルバも異常 | 実行環境側の問題として「Unknown」（判定不能） |
+| タイムアウト・コマンドの不在 | 実行環境側の問題として「Unknown」（判定不能） |
+
+FCrDNS の正引きが相手側で SERVFAIL となった場合は、「Not verified」（正引きが一致しない）として扱います。検索エンジンのクローラーを名乗る逆引きでこの状態になった場合は、偽装クローラーとして検出されます。
+
 ## 出力
 ### 出力内容
 | 項目 | 出力内容 |
@@ -162,7 +173,7 @@ Geofeed の URL は、RDAP の `links`（`rel: geofeed`）、または備考欄�
 | `tool` / `executed_at` / `target_ip` | ツール名・バージョン、実行日時、対象IP |
 | `network` | ネットワーク名・ハンドル・国・割当種別・範囲・CIDR・登録日・更新日・RIR・住所・備考 |
 | `asn` | ASN、AS 名、BGP プレフィックス、ASN 登録国、プレフィックス割当日 |
-| `dns` | PTR、FCrDNS の結果（`fcrdns_verified` は真偽値） |
+| `dns` | PTR、`ptr_status`（`found`: 取得成功 / `none`: 登録なし / `broken`: 相手側で SERVFAIL / `failed`: 実行環境側の失敗）、FCrDNS の結果（`fcrdns_verified` は真偽値） |
 | `ping_ms` / `tor_exit_node` / `dnsbl` | レイテンシ（取得できない場合は `null`）、Tor 判定、DNSBL 判定 |
 | `location` | `registered_country`（RDAP の登録国）、`geofeed`（`status`、`prefix`、`country`、`region`、`city`）、`check`（所在地の整合性チェックの結果） |
 | `abuse_contacts` / `entities` / `emails` | Abuse 連絡先、関与組織名、関与メールアドレス |

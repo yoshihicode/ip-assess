@@ -5,7 +5,7 @@
 # ============================================================
 
 SCRIPT_NAME="ip-assess"
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.3.2"
 
 usage() {
     echo "Usage: $0 [--json] <IPv4_ADDRESS>"
@@ -104,7 +104,8 @@ UNAVAILABLE_CHECKS=()
 
 # 汎用DNS問い合わせ
 #   引数: レコード種別 (A / PTR) と名前
-#   戻り値: 標準出力にレコード値（改行区切り、末尾ドット除去）。終了コード 0=取得成功 / 1=該当なし / 2=問い合わせ失敗
+#   戻り値: 標準出力にレコード値（改行区切り、末尾ドット除去）
+#   終了コード 0=取得成功 / 1=該当なし / 2=問い合わせ失敗（タイムアウト等） / 3=SERVFAIL
 dns_query() {
     local type="$1" qname="$2" out status
     if command -v dig >/dev/null 2>&1; then
@@ -117,6 +118,7 @@ dns_query() {
                 echo "$out"
                 return 0 ;;
             NXDOMAIN) return 1 ;;
+            SERVFAIL) return 3 ;;
             *) return 2 ;;
         esac
     elif command -v host >/dev/null 2>&1; then
@@ -126,15 +128,29 @@ dns_query() {
             return 0
         elif echo "$out" | grep -qE "NXDOMAIN|has no .* record"; then
             return 1
+        elif echo "$out" | grep -q "SERVFAIL"; then
+            return 3
         fi
         return 2
     fi
     return 2
 }
 
+# リゾルバ自体が正常かを確認する（SERVFAIL の原因が相手側か実行環境側かの切り分け用）
+#   ルートサーバーの A レコードはルートゾーンに含まれるため、正常なリゾルバなら必ず解決できる
+RESOLVER_HEALTHY=""
+resolver_healthy() {
+    if [ -z "$RESOLVER_HEALTHY" ]; then
+        if dns_query A "a.root-servers.net" >/dev/null; then RESOLVER_HEALTHY=1; else RESOLVER_HEALTHY=0; fi
+    fi
+    [ "$RESOLVER_HEALTHY" -eq 1 ]
+}
+
 # 逆引き(PTR) と FCrDNS（Forward-Confirmed reverse DNS）
 #   PTRは IP の管理者が自由に設定できるため、正引きで元のIPに戻ることを確認して初めて信頼できる
+#   PTR_STATUS: found（取得成功） / none（登録なし） / broken（相手側の逆引きが SERVFAIL） / failed（実行環境側の失敗）
 PTR="None"
+PTR_STATUS="none"
 PTR_ALL=""
 PTR_VERIFIED=0
 FCRDNS_STATUS="N/A (No PTR)"
@@ -142,10 +158,23 @@ REV_ARPA=$(echo "$IP" | awk -F'.' '{print $4"."$3"."$2"."$1".in-addr.arpa"}')
 
 PTR_ALL=$(dns_query PTR "$REV_ARPA")
 PTR_RC=$?
+if [ "$PTR_RC" -eq 3 ]; then
+    if resolver_healthy; then
+        PTR_RC=1
+        PTR_STATUS="broken"
+        PTR="None (lookup returned SERVFAIL: reverse DNS for this range is not working on the remote side)"
+        FCRDNS_STATUS="N/A (No usable PTR)"
+    else
+        PTR_RC=2
+    fi
+fi
+
 if [ "$PTR_RC" -eq 0 ]; then
+    PTR_STATUS="found"
     PTR=$(echo "$PTR_ALL" | head -n1)
     FCRDNS_STATUS="Not verified (forward lookup does not return ${IP})"
     FWD_FAILED=0
+    FWD_SERVFAIL=0
     for name in $PTR_ALL; do
         FWD=$(dns_query A "$name")
         rc=$?
@@ -155,14 +184,25 @@ if [ "$PTR_RC" -eq 0 ]; then
             FCRDNS_STATUS="Verified (${name} -> ${IP})"
             break
         fi
+        if [ "$rc" -eq 3 ]; then
+            # 相手側の正引きが壊れている場合は「検証できない＝一致しない」扱い。リゾルバ異常なら判定不能
+            if resolver_healthy; then FWD_SERVFAIL=1; else FWD_FAILED=1; fi
+        fi
         [ "$rc" -eq 2 ] && FWD_FAILED=1
     done
     if [ "$PTR_VERIFIED" -eq 0 ] && [ "$FWD_FAILED" -eq 1 ]; then
         FCRDNS_STATUS="Unknown (forward lookup failed)"
         UNAVAILABLE_CHECKS+=("FCrDNS")
+    elif [ "$PTR_VERIFIED" -eq 0 ] && [ "$FWD_SERVFAIL" -eq 1 ]; then
+        FCRDNS_STATUS="Not verified (forward lookup returned SERVFAIL on the remote side)"
     fi
 elif [ "$PTR_RC" -eq 2 ]; then
-    PTR="Unknown (DNS query failed / dig or host not found)"
+    PTR_STATUS="failed"
+    if [ "$RESOLVER_HEALTHY" = "0" ]; then
+        PTR="Unknown (local resolver is not working: SERVFAIL / health check failed)"
+    else
+        PTR="Unknown (DNS query failed on the local side: timeout / dig or host not found)"
+    fi
     FCRDNS_STATUS="Unknown"
     UNAVAILABLE_CHECKS+=("Reverse DNS (PTR)")
 fi
@@ -831,9 +871,9 @@ if echo "$IP_TYPE" | grep -qi "PA"; then
 fi
 
 # 一般回線特有の逆引きがない (+1)
-if [ "$PTR" = "None" ] && [ "$INFRA_SCORE" -gt 0 ]; then
+if { [ "$PTR_STATUS" = "none" ] || [ "$PTR_STATUS" = "broken" ]; } && [ "$INFRA_SCORE" -gt 0 ]; then
     indicator "[!] Risk Indicator [+1 pts]: No Reverse DNS (PTR) Record Found for Public Access Line"
-    detail "- Reverse DNS Result: None"
+    detail "- Reverse DNS Result: ${PTR}"
     detail "- Reason: Major domestic ISPs typically assign PTR hostnames to dynamic/fixed IPs, but their absence suggests a high likelihood of server usage."
     INFRA_SCORE=$((INFRA_SCORE + 1))
 fi
@@ -1008,6 +1048,7 @@ if [ "$JSON_MODE" -eq 1 ]; then
   },
   "dns": {
     "ptr": $(jstr "$PTR"),
+    "ptr_status": $(jstr "$PTR_STATUS"),
     "fcrdns": $(jstr "$FCRDNS_STATUS"),
     "fcrdns_verified": $( [ "$PTR_VERIFIED" -eq 1 ] && echo true || echo false )
   },
