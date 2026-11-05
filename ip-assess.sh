@@ -5,22 +5,28 @@
 # ============================================================
 
 SCRIPT_NAME="ip-assess"
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 
 usage() {
-    echo "Usage: $0 [--json] <IPv4_ADDRESS>"
+    echo "Usage: $0 [--json] [--plain] [--verbose] <IPv4_ADDRESS>"
     echo ""
     echo "Options:"
     echo "  --json        Output the result as JSON (machine-readable) instead of the text report"
+    echo "  --plain       Use ASCII markers ([!] [o] [i] [ ] [?]) instead of emoji"
+    echo "  --verbose     Also show the evidence and reasoning of each indicator"
     echo "  -v, --version Show version"
     echo "  -h, --help    Show this help"
 }
 
 JSON_MODE=0
+PLAIN_MODE=0
+VERBOSE_MODE=0
 IP=""
 for arg in "$@"; do
     case "$arg" in
         --json)        JSON_MODE=1 ;;
+        --plain)       PLAIN_MODE=1 ;;
+        --verbose)     VERBOSE_MODE=1 ;;
         -v|--version)  echo "${SCRIPT_NAME} ${SCRIPT_VERSION}"; exit 0 ;;
         -h|--help)     usage; exit 0 ;;
         -*)            echo "Error: Unknown option: ${arg}" >&2; usage >&2; exit 1 ;;
@@ -45,10 +51,11 @@ EXECUTED_AT=$(date +%Y-%m-%dT%H:%M:%S%z)
 DNS_RESOLVER=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf 2>/dev/null)
 [ -z "$DNS_RESOLVER" ] && DNS_RESOLVER="Unknown"
 
-# JSONモードではテキストレポートを捨て、最後にJSONのみを標準出力（fd 3）へ書き出す
-if [ "$JSON_MODE" -eq 1 ]; then
-    exec 3>&1 1>/dev/null
-fi
+# 判定処理中の出力（判定根拠の記録）は一時ファイルへ書き出し、
+# すべての判定が終わってから、テキストレポートまたは JSON を標準出力（fd 3）へ書き出す
+DETAIL_LOG=$(mktemp 2>/dev/null || echo "/tmp/ip-assess_${IP}_$$.log")
+trap 'rm -f "$DETAIL_LOG"' EXIT
+exec 3>&1 1>"$DETAIL_LOG"
 
 # JSON文字列のエスケープ
 json_escape() {
@@ -88,7 +95,7 @@ CURL_RES=$(curl -sL -w "%{http_code} %{url_effective}" -o "${TMP_FILE}" "https:/
 HTTP_STATUS="${CURL_RES%% *}"
 RDAP_URL="${CURL_RES#* }"
 if [ "$HTTP_STATUS" != "200" ]; then
-    echo "Error: Failed to retrieve information (HTTP Status: ${HTTP_STATUS})"
+    echo "Error: Failed to retrieve RDAP information (HTTP Status: ${HTTP_STATUS})" >&2
     if [ "$JSON_MODE" -eq 1 ]; then
         printf '{"tool":{"name":%s,"version":%s},"executed_at":%s,"target_ip":%s,"error":%s}\n' \
             "$(jstr "$SCRIPT_NAME")" "$(jstr "$SCRIPT_VERSION")" "$(jstr "$EXECUTED_AT")" "$(jstr "$IP")" \
@@ -812,6 +819,10 @@ SPOOFED_CRAWLER=0
 ISP_HIT=0
 SASE_HIT=0
 DC_HIT=0
+SUBLEASE_HIT=0
+VIRTUAL_HIT=0
+PA_HIT=0
+NOPTR_HIT=0
 METADATA_LOWER=$(echo "${NET_NAME} ${ALL_FNS} ${REMARKS} ${DOMAINS} ${ALL_ADDRESSES_TEXT}" | tr '[:upper:]' '[:lower:]')
 PTR_LOWER=""
 [ "$PTR_RC" -eq 0 ] && PTR_LOWER=$(echo "${PTR}" | tr '[:upper:]' '[:lower:]')
@@ -908,7 +919,7 @@ if [ "$DC_ASN_HIT" -eq 1 ] || [ "$DC_KEYWORD_HIT" -eq 1 ]; then
         detail "- Evidence: Known hosting ASN matched AS${ASN_NUM} (${AS_NAME})"
     fi
     if [ "$DC_KEYWORD_HIT" -eq 1 ]; then
-        DETECTED_DC=$(echo "$METADATA_LOWER $PTR_LOWER" | grep -oEi "$DC_REGEX" | head -n 3 | tr '\n' ' ')
+        DETECTED_DC=$(echo "$METADATA_LOWER $PTR_LOWER" | grep -oEi "$DC_REGEX" | sort -u | head -n 5 | tr '\n' ' ')
         detail "- Evidence: Keywords matched ${DETECTED_DC}"
     fi
     detail "- Reason: This is a datacenter, hosting, or cloud infrastructure which is not typically used by individual consumers."
@@ -919,6 +930,7 @@ fi
 # IP転貸・サブリース (異なるドメインの管理者が複数関与) (+3)
 if [ "$DOMAIN_COUNT" -ge 2 ]; then
     indicator "[!] Risk Indicator [+3 pts]: IP Sub-leasing / Domain Discrepancy (multiple operator domains)"
+    SUBLEASE_HIT=1
     detail "- Evidence: Multiple domain operators found"
     detail "- Reason: The IP is associated with multiple domain operators, which is common for proxy services or bulletproof hosting."
     INFRA_SCORE=$((INFRA_SCORE + 3))
@@ -951,6 +963,7 @@ fi
 # 仮想ロケーション疑い (+2)
 if [ "$PING_VAL" -ge 90 ] && [ "$DECLARED_JP" -eq 1 ]; then
     indicator "[!] Risk Indicator [+2 pts]: Virtual Location (IP Registration Location and Physical Location Mismatch) Suspected"
+    VIRTUAL_HIT=1
     detail "- Latency: ${PING_MS} ms (Registered Country: ${COUNTRY} / Geofeed: ${GEOFEED_TEXT})"
     detail "- Reason: Despite being registered in Japan, the ping response is 90ms or higher. Due to the physical limitations of optical cables, the actual server is likely located overseas, and the Japanese IP is being used to disguise its location."
     INFRA_SCORE=$((INFRA_SCORE + 2))
@@ -959,6 +972,7 @@ fi
 # 小分けブロック (PA) (+1)
 if echo "$IP_TYPE" | grep -qi "PA"; then
     indicator "[!] Risk Indicator [+1 pts]: IP Type is PA (Provider Aggregatable)"
+    PA_HIT=1
     detail "- IP Type  : ${IP_TYPE}"
     detail "- Reason: This is a provider-aggregatable IP address, commonly used for reselling or re-selling purposes."
     INFRA_SCORE=$((INFRA_SCORE + 1))
@@ -967,6 +981,7 @@ fi
 # 一般回線特有の逆引きがない (+1)
 if { [ "$PTR_STATUS" = "none" ] || [ "$PTR_STATUS" = "broken" ]; } && [ "$INFRA_SCORE" -gt 0 ]; then
     indicator "[!] Risk Indicator [+1 pts]: No Reverse DNS (PTR) Record Found for Public Access Line"
+    NOPTR_HIT=1
     detail "- Reverse DNS Result: ${PTR}"
     detail "- Reason: Major domestic ISPs typically assign PTR hostnames to dynamic/fixed IPs, but their absence suggests a high likelihood of server usage."
     INFRA_SCORE=$((INFRA_SCORE + 1))
@@ -1096,6 +1111,234 @@ echo "Reverse/Forward  : DNS via ${DNS_RESOLVER}"
 echo "Geofeed          : ${GEOFEED_URL:-Not published}"
 echo "RDAP Raw Data    : ${TMP_FILE}"
 echo "================================================================================"
+
+
+# ============================================================
+# テキストレポートの描画
+#   値は切り詰めず、端末の幅を超える場合は字下げして折り返す
+# ============================================================
+render_report() {
+    local W
+    W="${COLUMNS:-}"
+    if [ -z "$W" ] && [ -t 3 ] && command -v tput >/dev/null 2>&1; then W=$(tput cols 2>/dev/null); fi
+    [[ "$W" =~ ^[0-9]+$ ]] || W=100
+    [ "$W" -lt 60 ] && W=60
+
+    # 記号（絵文字は2桁、--plain の ASCII は3桁）
+    local M_RISK M_SAFE M_INFO M_NONE M_UNK M_WARN MW
+    if [ "$PLAIN_MODE" -eq 1 ]; then
+        M_RISK="[!]"; M_SAFE="[o]"; M_INFO="[i]"; M_NONE="[ ]"; M_UNK="[?]"; M_WARN="[~]"; MW=3
+    else
+        M_RISK="🔴"; M_SAFE="🟢"; M_INFO="🔵"; M_NONE="⚪"; M_UNK="❔"; M_WARN="🟡"; MW=2
+    fi
+    local BLANK
+    BLANK=$(printf '%*s' "$MW" '')
+
+    # 折り返し: wrap_print <字下げ桁数> <1行目の接頭辞> <値>
+    wrap_print() {
+        local indent="$1" prefix="$2" value="$3" width first=1 line pad
+        width=$(( W - indent ))
+        [ "$width" -lt 20 ] && width=20
+        pad=$(printf '%*s' "$indent" '')
+        if [ -z "$value" ]; then printf '%s\n' "$prefix" | sed 's/ *$//'; return; fi
+        while IFS= read -r line; do
+            if [ "$first" -eq 1 ]; then printf '%s%s\n' "$prefix" "$line"; first=0
+            else printf '%s%s\n' "$pad" "$line"; fi
+        done < <(printf '%s\n' "$value" | fold -s -w "$width" | sed 's/ *$//')
+    }
+    kv() { wrap_print 25 "$(printf '  %-22s ' "$1")" "${2:--}"; }
+    row() {
+        # row <記号> <点数> <項目名> <根拠>
+        local pts="$2"
+        [ -n "$pts" ] && [ "$pts" -gt 0 ] 2>/dev/null && pts="+${pts}"
+        wrap_print $(( MW + 42 )) "$(printf '  %s %4s  %-32s ' "$1" "$pts" "$3")" "$4"
+    }
+    rule() { printf '%*s\n' "$W" '' | tr ' ' '='; }
+
+    local score_txt="$INFRA_SCORE"
+    [ "$INFRA_SCORE" -gt 0 ] && score_txt="+${INFRA_SCORE}"
+
+    # ---------------- サマリー ----------------
+    printf '%s%*s\n' "$SCRIPT_NAME" $(( W - ${#SCRIPT_NAME} )) "$EXECUTED_AT"
+    rule
+    echo "  ${IP}"
+    echo ""
+    local m
+    case "$PRIORITY" in HIGH) m="$M_RISK" ;; MEDIUM) m="$M_WARN" ;; *) m="$M_SAFE" ;; esac
+    wrap_print $(( MW + 28 )) "  ${m} Investigation Priority : " "$PRIORITY"
+    wrap_print $(( MW + 28 )) "  ${BLANK} Infrastructure         : " "${INFRA_CLASS}  (score ${score_txt})"
+    case "$THREAT_LEVEL" in DETECTED) m="$M_RISK" ;; UNKNOWN) m="$M_UNK" ;; *) m="$M_NONE" ;; esac
+    wrap_print $(( MW + 28 )) "  ${m} Threat Reputation      : " "$THREAT_TEXT"
+    if [ "${#UNAVAILABLE_CHECKS[@]}" -gt 0 ]; then
+        wrap_print $(( MW + 28 )) "  ${M_WARN} Confidence             : " "PARTIAL - could not complete: $(IFS=,; echo "${UNAVAILABLE_CHECKS[*]}" | sed 's/,/, /g')"
+    else
+        wrap_print $(( MW + 28 )) "  ${M_SAFE} Confidence             : " "FULL - all checks completed"
+    fi
+    [ -n "$NOTE" ] && wrap_print $(( MW + 28 )) "  ${M_INFO} Note                   : " "$NOTE"
+    rule
+
+    # ---------------- ネットワーク ----------------
+    echo ""
+    echo "NETWORK"
+    kv "Network Name"       "$NET_NAME"
+    kv "Network Handle"     "$NET_HANDLE"
+    kv "Allocated Range"    "$NET_RANGE"
+    kv "Allocated CIDR"     "$NET_CIDRS"
+    kv "Allocation Type"    "$IP_TYPE"
+    kv "Registered"         "$REG_DATE"
+    kv "Last Changed"       "$CHANGED_DATE"
+    kv "RIR"                "${RIR} (${RIR_COUNTRY})"
+    kv "Remarks"            "$REMARKS"
+    kv "ASN"                "$ASN"
+    kv "AS Name"            "$AS_NAME"
+    kv "BGP Prefix"         "$BGP_PREFIX"
+    kv "ASN Country"        "$ASN_CC"
+    kv "Prefix Allocated"   "$PREFIX_ALLOCATED"
+    kv "Reverse DNS (PTR)"  "${PTR}$( [ "$PTR_COUNT" -gt 1 ] && echo " (+$((PTR_COUNT - 1)) more: $(echo "$PTR_ALL" | tail -n +2 | tr '\n' ' ' | sed 's/ $//'))")"
+    kv "FCrDNS"             "$FCRDNS_STATUS"
+
+    # ---------------- 所在地 ----------------
+    echo ""
+    echo "LOCATION"
+    kv "Registered Country" "$COUNTRY"
+    kv "Declared (Geofeed)" "$GEOFEED_TEXT"
+    if [ -n "$HOLDER_DESC" ]; then kv "Holder Address" "${ADDRESS}  [${HOLDER_DESC}]"; else kv "Holder Address" "$ADDRESS"; fi
+    kv "Holder Country"     "$HOLDER_COUNTRY"
+    kv "Latency"            "$PING_STR"
+    case "$LOCATION_CHECK" in
+        CONSISTENT*) m="$M_SAFE" ;; MISMATCH*) m="$M_RISK" ;; DECLARATIONS*) m="$M_WARN" ;; NOT\ VERIFIED*) m="$M_UNK" ;; *) m="$M_NONE" ;;
+    esac
+    kv "Check"              "${m} ${LOCATION_CHECK}"
+
+    # ---------------- 連絡先・登録情報 ----------------
+    echo ""
+    echo "CONTACTS"
+    echo "  Registered Addresses"
+    if [ -n "$ADDRESSES" ]; then
+        while IFS=$'\t' read -r a_kind a_name a_roles a_handle a_addr a_cc; do
+            wrap_print 6 "    - " "[${a_kind}] ${a_name} (${a_roles}) [${a_handle}]"
+            wrap_print 8 "        " "${a_addr}$( [ -n "$a_cc" ] && echo "  (Country: ${a_cc})")"
+        done <<< "$ADDRESSES"
+    else
+        echo "    - Not found in RDAP response"
+    fi
+    echo "  Abuse Contact"
+    if [ -n "$ABUSE_CONTACTS" ]; then
+        while IFS='|' read -r mail name handle; do
+            wrap_print 6 "    - " "$(echo $mail)  [Name: $(echo $name) / Handle: $(echo $handle)]"
+        done <<< "$ABUSE_CONTACTS"
+    else
+        echo "    - Not found in RDAP response"
+    fi
+    echo "  Entities"
+    if [ -n "$ALL_FNS" ]; then
+        while read -r fn; do [ -n "$fn" ] && wrap_print 6 "    - " "$fn"; done <<< "$ALL_FNS"
+    else
+        echo "    - None"
+    fi
+    echo "  Emails / Operator Domains"
+    if [ -n "$ALL_EMAILS" ]; then
+        while read -r email; do
+            [ -n "$email" ] && wrap_print 6 "    - " "${email}  [Domain: ${email#*@}]"
+        done <<< "$ALL_EMAILS"
+    else
+        echo "    - None"
+    fi
+
+    # ---------------- 回線種別 ----------------
+    echo ""
+    echo "INFRASTRUCTURE ATTRIBUTES (points)"
+    # 国内一般回線
+    if [ "$ISP_HIT" -eq 1 ]; then row "$M_SAFE" "-5" "Domestic consumer ISP" "$ISP_EVIDENCE"
+    elif [ -n "$ISP_NAME_IN_META" ] && [ -n "$ASN_NUM" ]; then row "$M_INFO" "" "Domestic consumer ISP" "'${ISP_NAME_IN_META}' in records, but routed by AS${ASN_NUM} (not a consumer ISP)"
+    else row "$M_NONE" "" "Domestic consumer ISP" ""; fi
+    # SASE
+    if [ "$SASE_HIT" -eq 1 ]; then row "$M_SAFE" "-5" "Enterprise SASE" "$DETECTED_SASE"
+    else row "$M_NONE" "" "Enterprise SASE" ""; fi
+    # 検索エンジンクローラー
+    if [ "$VERIFIED_CRAWLER" -eq 1 ]; then row "$M_SAFE" "-5" "Verified search engine crawler" "FCrDNS-verified PTR '${PTR}'"
+    elif [ "$PTR_STATUS" = "failed" ]; then row "$M_UNK" "" "Verified search engine crawler" "reverse DNS could not be checked"
+    else row "$M_NONE" "" "Verified search engine crawler" ""; fi
+    # データセンター
+    if [ "$DC_HIT" -eq 1 ]; then
+        local ev=""
+        [ "$DC_ASN_HIT" -eq 1 ] && ev="AS${ASN_NUM} (${AS_NAME})"
+        [ "$DC_KEYWORD_HIT" -eq 1 ] && ev="${ev:+${ev} / }keyword: $(echo "$METADATA_LOWER $PTR_LOWER" | grep -oEi "$DC_REGEX" | sort -u | tr '\n' ' ' | sed 's/ $//; s/ /, /g')"
+        row "$M_RISK" "3" "Datacenter / Hosting / Cloud" "$ev"
+    else row "$M_NONE" "" "Datacenter / Hosting / Cloud" ""; fi
+    # IP 転貸
+    if [ "$SUBLEASE_HIT" -eq 1 ]; then row "$M_RISK" "3" "IP sub-leasing (domain mismatch)" "$(echo "$DOMAINS" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')"
+    else row "$M_NONE" "" "IP sub-leasing (domain mismatch)" "$(echo "$DOMAINS" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')"; fi
+    # 私書箱
+    local box_ev=""
+    if [ -n "$BOX_HITS" ]; then
+        box_ev=$(echo "$BOX_HITS" | awk -F'\t' '{printf "%s[%s] %s: %s", (NR > 1 ? " / " : ""), $1, $2, $5}')
+    fi
+    if [ -n "$BOX_ORG_HITS" ]; then row "$M_RISK" "2" "PO box / virtual office" "$box_ev"
+    elif [ -n "$BOX_HITS" ]; then row "$M_INFO" "" "PO box / virtual office" "individual contact only (not scored): ${box_ev}"
+    else row "$M_NONE" "" "PO box / virtual office" ""; fi
+    # 仮想ロケーション
+    if [ "$VIRTUAL_HIT" -eq 1 ]; then row "$M_RISK" "2" "Virtual location" "${PING_MS} ms while declared JP"
+    elif [ -z "$PING_MS" ]; then row "$M_UNK" "" "Virtual location" "no latency measurement (${PING_STR})"
+    else row "$M_NONE" "" "Virtual location" "${PING_MS} ms"; fi
+    # PA
+    if [ "$PA_HIT" -eq 1 ]; then row "$M_RISK" "1" "PA allocation" "$IP_TYPE"
+    else row "$M_NONE" "" "PA allocation" "$IP_TYPE"; fi
+    # 逆引きなし
+    if [ "$NOPTR_HIT" -eq 1 ]; then row "$M_RISK" "1" "No usable reverse DNS" "$PTR"
+    elif [ "$PTR_STATUS" = "none" ] || [ "$PTR_STATUS" = "broken" ]; then row "$M_INFO" "" "No usable reverse DNS" "not scored (no other risk indicators): ${PTR}"
+    elif [ "$PTR_STATUS" = "failed" ]; then row "$M_UNK" "" "No usable reverse DNS" "$PTR"
+    else row "$M_NONE" "" "No usable reverse DNS" "PTR found"; fi
+
+    # ---------------- 脅威の評判 ----------------
+    echo ""
+    echo "THREAT REPUTATION"
+    if [ -n "$DNSBL_HIT" ]; then row "$M_RISK" "" "Spamhaus ZEN" "$DNSBL_STATUS"
+    elif [ "$DNSBL_INFO" = "PBL" ]; then row "$M_INFO" "" "Spamhaus ZEN" "PBL only (end-user range, not a threat)"
+    elif [[ "$DNSBL_STATUS" == Unknown* ]]; then row "$M_UNK" "" "Spamhaus ZEN" "$DNSBL_STATUS"
+    else row "$M_NONE" "" "Spamhaus ZEN" "not listed"; fi
+    if [ "$TOR_HIT" -eq 1 ]; then row "$M_RISK" "" "Tor exit node" "$TOR_STATUS"
+    elif [[ "$TOR_STATUS" == Unknown* ]]; then row "$M_UNK" "" "Tor exit node" "$TOR_STATUS"
+    else row "$M_NONE" "" "Tor exit node" "not listed"; fi
+    if [ "$SPOOFED_CRAWLER" -eq 1 ]; then row "$M_RISK" "" "Spoofed crawler PTR" "PTR '${PTR}' claims a crawler domain but is not forward-confirmed"
+    elif [ "$PTR_STATUS" = "failed" ] || [[ "$FCRDNS_STATUS" == Unknown* ]]; then row "$M_UNK" "" "Spoofed crawler PTR" "reverse DNS could not be checked"
+    else row "$M_NONE" "" "Spoofed crawler PTR" ""; fi
+
+    echo ""
+    echo "  ${M_RISK} risk  ${M_SAFE} safe  ${M_INFO} info  ${M_NONE} not detected  ${M_UNK} could not check"
+
+    # ---------------- 判定の根拠（--verbose） ----------------
+    if [ "$VERBOSE_MODE" -eq 1 ]; then
+        echo ""
+        echo "DETAILS (evidence and reasoning)"
+        local lead content hang
+        while IFS= read -r line; do
+            if [ -z "$line" ]; then echo ""; continue; fi
+            content="${line#"${line%%[! ]*}"}"
+            lead=$(( ${#line} - ${#content} ))
+            case "$content" in "- "*) hang=2 ;; "["*) hang=4 ;; *) hang=0 ;; esac
+            wrap_print $(( 2 + lead + hang )) "  $(printf '%*s' "$lead" '')" "$content"
+        done < <(sed -n '/^\[3\] Analysis$/,/^\[4\] Report Summary$/p' "$DETAIL_LOG" | sed '1,2d' | sed '/^=*$/d; /^\[4\] Report Summary$/d' | awk 'NF {print; blank=0; next} !blank {print; blank=1}')
+    else
+        echo "  Run with --verbose for evidence, --json for machine-readable output."
+    fi
+
+    # ---------------- データソース ----------------
+    echo ""
+    echo "DATA SOURCES"
+    kv "RDAP"              "$RDAP_URL"
+    kv "Tor Exit List"     "https://check.torproject.org/torbulkexitlist"
+    kv "DNSBL"             "zen.spamhaus.org (via ${DNS_RESOLVER})"
+    kv "ASN"               "Team Cymru IP to ASN Mapping"
+    kv "Geofeed"           "${GEOFEED_URL:-Not published}"
+    kv "DNS Resolver"      "$DNS_RESOLVER"
+    kv "RDAP Raw Data"     "$TMP_FILE"
+    rule
+}
+
+if [ "$JSON_MODE" -eq 0 ]; then
+    render_report >&3
+fi
 
 # JSON 出力
 if [ "$JSON_MODE" -eq 1 ]; then
