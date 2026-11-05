@@ -5,7 +5,7 @@
 # ============================================================
 
 SCRIPT_NAME="ip-assess"
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="1.4.0"
 
 usage() {
     echo "Usage: $0 [--json] <IPv4_ADDRESS>"
@@ -609,8 +609,72 @@ elif echo "$PORT43" | grep -qi "afrinic"; then
 fi
 
 # 住所(label)
-ADDRESS=$(grep -oEi '"label"\s*:\s*"[^"]+"' "${TMP_FILE}" | head -n 1 | sed -E 's/.*:\s*"([^"]+)".*/\1/' | tr '\n' ' ')
+# 住所（各エンティティの vCard の adr）
+#   出力: 種別<TAB>名前<TAB>役割<TAB>ハンドル<TAB>住所<TAB>国  （1住所1行）
+#   住所は label（書式付き文字列）を優先し、なければ構造化された要素から組み立てる
+#   入れ子のエンティティ（ARIN 等）にも対応する
+ADDRESSES=$(echo "$RDAP_FLAT" | awk -F'\t' '
+    function squeeze(v) { gsub(/[ \t]+/, " ", v); sub(/^ /, "", v); sub(/ $/, "", v); return v }
+    {
+        if (!match($1, /^(\.entities\[[0-9]+\])+/)) next
+        e = substr($1, 1, RLENGTH); rest = substr($1, RLENGTH + 1)
+        if (!(e in seen)) { seen[e] = 1; order[++ne] = e }
+        if (rest ~ /^\.roles\[[0-9]+\]$/) { roles[e] = roles[e] (roles[e] ? ", " : "") $2; next }
+        if (rest == ".handle") { handle[e] = $2; next }
+        if (rest !~ /^\.vcardArray\[1\]\[[0-9]+\]/) next
+        r = rest; sub(/^\.vcardArray\[1\]\[/, "", r)
+        k = r; sub(/\].*$/, "", k); r = substr(r, length(k) + 2)
+        if (!((e, k) in kseen)) { kseen[e, k] = 1; kcount[e]++; korder[e, kcount[e]] = k }
+        if (r == "[0]") pname[e, k] = $2
+        else if (r == "[1].label") label[e, k] = $2
+        else if (r == "[1].cc") cc[e, k] = $2
+        else if (r == "[3]") pval[e, k] = $2
+        else if (r ~ /^\[3\]\[[0-9]+\]/) {
+            c = r; sub(/^\[3\]\[/, "", c); sub(/\].*$/, "", c)
+            comp[e, k, c] = comp[e, k, c] (comp[e, k, c] != "" ? " " : "") $2
+        }
+    }
+    END {
+        for (i = 1; i <= ne; i++) {
+            e = order[i]; kind = ""; fn = ""
+            for (j = 1; j <= kcount[e]; j++) {
+                k = korder[e, j]
+                if (pname[e, k] == "kind") kind = pval[e, k]
+                if (pname[e, k] == "fn") fn = pval[e, k]
+            }
+            for (j = 1; j <= kcount[e]; j++) {
+                k = korder[e, j]
+                if (pname[e, k] != "adr") continue
+                addr = squeeze(label[e, k])
+                if (addr == "") {
+                    for (c = 0; c <= 6; c++) {
+                        v = squeeze(comp[e, k, c])
+                        if (v != "") addr = addr (addr != "" ? ", " : "") v
+                    }
+                }
+                if (addr == "") continue
+                country = (cc[e, k] != "") ? toupper(cc[e, k]) : squeeze(comp[e, k, 6])
+                printf "%s\t%s\t%s\t%s\t%s\t%s\n", (kind != "" ? kind : "unknown"), (fn != "" ? fn : "-"), (roles[e] != "" ? roles[e] : "-"), (handle[e] != "" ? handle[e] : "-"), addr, country
+            }
+        }
+    }')
+
+# 代表の住所: 登録組織（registrant かつ org） → 組織（org） → 登録者（registrant） → 最初の住所
+HOLDER_LINE=$(echo "$ADDRESSES" | awk -F'\t' '
+    NF < 5 { next }
+    { s = 0
+      if ($1 == "org" && $3 ~ /registrant/) s = 4
+      else if ($1 == "org") s = 3
+      else if ($3 ~ /registrant/) s = 2
+      else s = 1
+      if (s > best) { best = s; line = $0 } }
+    END { if (best) print line }')
+ADDRESS=$(echo "$HOLDER_LINE" | awk -F'\t' '{print $5}')
+HOLDER_COUNTRY=$(echo "$HOLDER_LINE" | awk -F'\t' '{print $6}')
+HOLDER_DESC=$(echo "$HOLDER_LINE" | awk -F'\t' 'NF >= 5 {print $1 ": " $2 " / " $3}')
 [ -z "$ADDRESS" ] && ADDRESS="Unknown"
+[ -z "$HOLDER_COUNTRY" ] && HOLDER_COUNTRY="Unknown"
+ALL_ADDRESSES_TEXT=$(echo "$ADDRESSES" | awk -F'\t' '{print $5}' | tr '\n' ' ')
 
 # 備考: ネットワーク自身の remarks のみ（notices の利用規約文などは除外）
 REMARKS=$(echo "$RDAP_FLAT" | awk -F'\t' '$1 ~ /^\.remarks\[[0-9]+\]\.description\[[0-9]+\]$/ {print $2}' | head -n 3 | tr '\n' ' ' | sed 's/ $//')
@@ -654,12 +718,17 @@ echo "Registered             : ${REG_DATE}"
 echo "Last Changed           : ${CHANGED_DATE}"
 echo "RIR                    : ${RIR}"
 echo "RIR Country            : ${RIR_COUNTRY}"
-echo "Admin Physical Address : ${ADDRESS}"
+if [ -n "$HOLDER_DESC" ]; then
+    echo "Holder Address         : ${ADDRESS}  [${HOLDER_DESC}]"
+else
+    echo "Holder Address         : ${ADDRESS}"
+fi
 echo "Remarks                : ${REMARKS}"
 echo "Reverse DNS (PTR)      : ${PTR}$( [ "$PTR_COUNT" -gt 1 ] && echo " (+$((PTR_COUNT - 1)) more)")"
 echo "FCrDNS                 : ${FCRDNS_STATUS}"
 echo "Ping Latency           : ${PING_STR}"
 echo "Geofeed Location       : ${GEOFEED_TEXT}"
+echo "Holder Address Country : ${HOLDER_COUNTRY}"
 echo "Location Check         : ${LOCATION_CHECK}"
 echo "Tor Exit Node          : ${TOR_STATUS}"
 echo "DNSBL Status           : ${DNSBL_STATUS}"
@@ -668,6 +737,16 @@ echo "AS Name                : ${AS_NAME}"
 echo "BGP Prefix             : ${BGP_PREFIX}"
 echo "ASN Registered Country : ${ASN_CC}"
 echo "Prefix Allocated (RIR) : ${PREFIX_ALLOCATED}"
+echo ""
+echo "--- Registered Addresses (RDAP vCard) ---"
+if [ -n "$ADDRESSES" ]; then
+    echo "$ADDRESSES" | while IFS=$'\t' read -r a_kind a_name a_roles a_handle a_addr a_cc; do
+        echo "  - [${a_kind}] ${a_name} (${a_roles}) [${a_handle}]"
+        echo "      ${a_addr}$( [ -n "$a_cc" ] && echo "  (Country: ${a_cc})")"
+    done
+else
+    echo "  - Not found in RDAP response"
+fi
 echo ""
 echo "--- Abuse Contact (for reporting) ---"
 if [ -n "$ABUSE_CONTACTS" ]; then
@@ -733,7 +812,7 @@ SPOOFED_CRAWLER=0
 ISP_HIT=0
 SASE_HIT=0
 DC_HIT=0
-METADATA_LOWER=$(echo "${NET_NAME} ${ALL_FNS} ${REMARKS} ${DOMAINS} ${ADDRESS}" | tr '[:upper:]' '[:lower:]')
+METADATA_LOWER=$(echo "${NET_NAME} ${ALL_FNS} ${REMARKS} ${DOMAINS} ${ALL_ADDRESSES_TEXT}" | tr '[:upper:]' '[:lower:]')
 PTR_LOWER=""
 [ "$PTR_RC" -eq 0 ] && PTR_LOWER=$(echo "${PTR}" | tr '[:upper:]' '[:lower:]')
 # 減点（安全側）の判定には、なりすまし防止のため FCrDNS 検証済みの PTR のみを使う
@@ -846,12 +925,27 @@ if [ "$DOMAIN_COUNT" -ge 2 ]; then
 fi
 
 # 私書箱 / バーチャルオフィスの検出 (+2)
-if echo "$ADDRESS" | grep -qEi "(suite\s+[0-9]|ste\.?\s+[0-9]|po\s*box|private\s*box)"; then
-    MATCH_BOX=$(echo "$ADDRESS" | grep -oEi "(suite\s+[0-9]+|ste\.?\s+[0-9]+|po\s*box\s*[0-9]+)" | head -n 1)
-    indicator "[!] Risk Indicator [+2 pts]: Private mailbox / Virtual office address detected"
-    detail "- Evidence  : '${MATCH_BOX}' (Full Address: ${ADDRESS})"
-    detail "- Reason: Typical of paper companies with no physical office. Used by suspicious hosting providers or attackers to conceal their identity."
-    INFRA_SCORE=$((INFRA_SCORE + 2))
+#   すべてのエンティティの住所を対象とし、どのエンティティの住所かを根拠に表示する
+BOX_HITS=$(echo "$ADDRESSES" | awk -F'\t' 'NF >= 5 && tolower($5) ~ /(suite[[:space:]]+[0-9]|ste\.?[[:space:]]+[0-9]|p\.?[[:space:]]*o\.?[[:space:]]*box|private[[:space:]]*box)/')
+# 加点するのは組織・グループ等の住所が該当した場合のみ。個人（individual）の連絡先住所だけなら Info として表示
+BOX_ORG_HITS=$(echo "$BOX_HITS" | awk -F'\t' 'NF >= 5 && $1 != "individual"')
+if [ -n "$BOX_HITS" ]; then
+    if [ -n "$BOX_ORG_HITS" ]; then
+        indicator "[!] Risk Indicator [+2 pts]: Private mailbox / Virtual office address detected"
+    else
+        indicator "[i] Info: Private mailbox address found only in an individual contact's address"
+    fi
+    # パイプにするとサブシェルになり JSON 用の記録が消えるため、ヒアストリングで回す
+    while IFS=$'\t' read -r a_kind a_name a_roles a_handle a_addr a_cc; do
+        MATCH_BOX=$(echo "$a_addr" | grep -oEi "(suite[[:space:]]+[0-9]+|ste\.?[[:space:]]+[0-9]+|p\.?[[:space:]]*o\.?[[:space:]]*box[[:space:]]*[0-9]*|private[[:space:]]*box)" | head -n 1)
+        detail "- Evidence  : '${MATCH_BOX}' in [${a_kind}] ${a_name} (${a_roles}): ${a_addr}"
+    done <<< "$BOX_HITS"
+    if [ -n "$BOX_ORG_HITS" ]; then
+        detail "- Reason: Typical of paper companies with no physical office. Used by suspicious hosting providers or attackers to conceal their identity."
+        INFRA_SCORE=$((INFRA_SCORE + 2))
+    else
+        detail "- Reason : A mailbox in a personal contact address is common and is not scored. The organization address does not use one."
+    fi
 fi
 
 # 仮想ロケーション疑い (+2)
@@ -1037,6 +1131,12 @@ if [ "$JSON_MODE" -eq 1 ]; then
     "last_changed": $(jstr "$CHANGED_DATE_RAW"),
     "rir": $(jstr "$RIR"),
     "address": $(jstr "$ADDRESS"),
+    "holder_country": $(jstr "$HOLDER_COUNTRY"),
+    "addresses": [$(echo "$ADDRESSES" | awk -F'\t' 'NF >= 5' | { first=1; while IFS=$'\t' read -r a_kind a_name a_roles a_handle a_addr a_cc; do
+        [ "$first" -eq 1 ] && first=0 || printf ','
+        printf '{"kind":%s,"name":%s,"roles":%s,"handle":%s,"address":%s,"country":%s}' \
+            "$(jstr "$a_kind")" "$(jstr "$a_name")" "$(jstr "$a_roles")" "$(jstr "$a_handle")" "$(jstr "$a_addr")" "$(jstr "$a_cc")"
+    done; })],
     "remarks": $(jstr "$REMARKS")
   },
   "asn": {
